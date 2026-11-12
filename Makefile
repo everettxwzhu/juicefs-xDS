@@ -31,6 +31,38 @@ juicefs: Makefile cmd/*.go pkg/*/*.go go.*
 	go version
 	go build -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs .
 
+.PHONY: juicefs.xds
+
+# Keep the C sources in sync with pkg/xds/cgo_*.c. Go does not track these
+# external includes, so their contents must also participate in cgo's cache key.
+# Use a recursive variable: ordinary builds must not inspect the xDS submodule.
+XDS_CLIENT_INPUTS = xDS/src/client/xds_client.c \
+	xDS/src/client/xds_control.c xDS/src/client/xds_shm_queue.c \
+	xDS/src/client/xds_cpu_buffer_mapping.c xDS/src/client/xds_namespace.c \
+	xDS/kernels/user/xds_p2p_user.c \
+	$(sort $(wildcard xDS/include/xds/*.h xDS/src/client/*.h \
+		xDS/kernels/user/include/*.h xDS/kernels/include/*.h))
+
+# Build the standalone service and its SPDK/user-space dependencies first.
+# The service target does not install the Python SDK or build kernel modules.
+# JOBS can be set on the command line to limit the SPDK build's parallelism.
+juicefs.xds:
+	@test "$$(go env GOOS)" = linux || { echo 'juicefs.xds requires GOOS=linux' >&2; exit 1; }
+	@test "$$(go env CGO_ENABLED)" = 1 || { echo 'juicefs.xds requires CGO_ENABLED=1' >&2; exit 1; }
+	@test -z "$(STATIC)" || { echo 'juicefs.xds does not support STATIC: NVIDIA registration loads libcuda.so.1 dynamically' >&2; exit 1; }
+	@test -f xDS/include/xds/client.h -a -f xDS/Makefile -a -f xDS/spdk4xds/configure -a -f xDS/spdk4xds/dpdk/meson.build || { echo 'xDS sources are missing; run: git submodule update --init --recursive xDS' >&2; exit 1; }
+	$(MAKE) -C xDS service BUILD="$(BUILD)"
+	go version
+	@set -eu; \
+		manifest="$$(sha256sum $(XDS_CLIENT_INPUTS))"; \
+		digest="$$(printf '%s\n' "$$manifest" | sha256sum)"; \
+		digest="$${digest%% *}"; \
+		cgo_cflags="$$(go env CGO_CFLAGS)"; \
+		export CGO_CFLAGS="$$cgo_cflags -DJFS_XDS_NATIVE_HASH_$$digest=1"; \
+		JFS_XDS_TEST_SERVICE= go test -tags xds -count=1 -gcflags="$(GCFLAGS)" ./pkg/xds; \
+		go vet -tags xds ./pkg/xds; \
+		go build -tags xds -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o $@ .
+
 juicefs.cover: Makefile cmd/*.go pkg/*/*.go go.*
 	go version
 	go build -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -cover -o juicefs .

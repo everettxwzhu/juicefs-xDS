@@ -45,6 +45,7 @@ test*.bak
 /juicefs.exe~
 /juicefsd.exe~
 /juicefs.lite
+/juicefs.xds
 dist/
 juicefs.egg-info/
 pkg/meta/jfs-load-dump/

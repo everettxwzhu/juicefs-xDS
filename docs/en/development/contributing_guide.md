@@ -13,6 +13,42 @@ description: JuiceFS is open source software and the code is contributed and mai
 
 Read [internals](./internals.md) for important data structure references.
 
+## Building with xDS
+
+On Linux, initialize the nested xDS submodules and install the SPDK build
+dependencies once, following [xDS's build instructions](https://github.com/Codesheep11/xDS#构建).
+The service also requires the LZ4 development library (`liblz4-dev` on Ubuntu).
+Then build from the JuiceFS repository root:
+
+```sh
+git submodule update --init --recursive xDS
+make juicefs.xds
+```
+
+This builds the xDS user-space P2P library, SPDK and
+`xDS/src/service/xds_service`, runs the xDS client's tests and `go vet`, and
+builds `./juicefs.xds`. The client C sources are compiled by cgo. The target
+adds a content hash of the external client sources and headers to `CGO_CFLAGS`
+for the Go tests, vet and build, preserving the existing compiler options.
+Changes to these files therefore rebuild the client automatically; no manual
+cache cleanup or `-a` is needed. Use `make juicefs.xds JOBS=8`
+to limit SPDK build parallelism, or `make juicefs.xds BUILD=debug` for the Go
+binary and xDS service debug flags. Existing SPDK configuration is preserved.
+
+The target requires cgo and does not support `STATIC=1`. It does not install
+the Python SDK, build or load vendor kernel modules, configure devices, or
+start the service. Tests requiring a running xDS service are skipped. At this
+development stage, the root command does not yet provide a GPU-read interface;
+the package tests ensure the native client is compiled and linked. Full package
+regression tests remain a separate `make test.pkg` command with their own service
+and GlusterFS dependencies.
+
+The build-cache regression tests can be run without an xDS service or SPDK:
+
+```sh
+python3 test/xds_build_cache_test.py
+```
+
 ## Coding style
 
 - We're following ["Effective Go"](https://go.dev/doc/effective_go) and ["Go Code Review Comments"](https://github.com/golang/go/wiki/CodeReviewComments).

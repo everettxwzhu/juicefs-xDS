@@ -11,6 +11,37 @@ description: JuiceFS 是开源软件，代码由全球开发者共同贡献和�
 - 如果这是一个重大的特性更新，写一份设计文档来帮助社区理解你的动机和解决方案。
 - 对于首次贡献者来说，找到合适 issue 的好方法是使用标签 ["kind/good-first-issue"](https://github.com/juicedata/juicefs/labels/kind%2Fgood-first-issue) 或 ["kind/help-wanted"](https://github.com/juicedata/juicefs/labels/kind%2Fhelp-wanted) 搜索未解决的问题。
 
+## 构建 xDS 版本 {#building-with-xds}
+
+在 Linux 上，首次构建需初始化 xDS 的嵌套子模块，并参考
+[xDS 构建说明](https://github.com/Codesheep11/xDS#构建) 安装 SPDK 编译依赖。
+服务还需要 LZ4 开发库（Ubuntu 对应 `liblz4-dev`）。之后在 JuiceFS 仓库根目录执行：
+
+```sh
+git submodule update --init --recursive xDS
+make juicefs.xds
+```
+
+此目标会构建 xDS 用户态 P2P 库、SPDK 和 `xDS/src/service/xds_service`，
+运行 xDS 客户端单元测试及 `go vet`，最后生成 `./juicefs.xds`。
+客户端 C 源码由 cgo 编译。构建目标将外部客户端源码和头文件的内容摘要加入
+Go 测试、vet 和构建共用的 `CGO_CFLAGS`，同时保留已有编译选项。
+修改这些文件后会自动重编客户端，无需手动清理缓存或执行 `-a`。
+可使用 `make juicefs.xds JOBS=8` 限制 SPDK 编译并发，
+或使用 `make juicefs.xds BUILD=debug` 启用 Go 程序和 xDS 服务的调试编译参数。
+已有 SPDK 配置会保留。
+
+此目标要求启用 cgo，暂不支持 `STATIC=1`；不会安装 Python SDK、编译或加载厂商内核模块、
+配置设备或启动服务。需要运行中 xDS 服务的测试会跳过。
+当前开发阶段的根命令尚未提供 GPU 读取接口，客户端的编译和链接由包测试验证。
+全包回归仍通过独立的 `make test.pkg` 运行，并需要其对应的服务和 GlusterFS 依赖。
+
+构建缓存的回归测试不依赖 xDS 服务或 SPDK，可单独运行：
+
+```sh
+python3 test/xds_build_cache_test.py
+```
+
 ## 代码风格 {#coding-style}
 
 - 我们遵循 ["Effective Go"](https://go.dev/doc/effective_go) 和 ["Go Code Review Comments"](https://github.com/golang/go/wiki/CodeReviewComments)。
