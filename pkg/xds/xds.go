@@ -205,6 +205,9 @@ func openVolume(c client, m meta.Meta, store chunk.ChunkStore, blockSize, readah
 		ioUnit: int(cm.ioUnit), gpuBufferSize: cm.gpuBufferSize,
 		bgCtx: bgCtx, cancel: cancel,
 	}
+	// Bind cache dependencies only after zero-slot initialization succeeded.
+	// initCache starts no workers; the fully initialized Volume is published below.
+	t.initCache(v)
 	committed = true
 	return v, nil
 }
