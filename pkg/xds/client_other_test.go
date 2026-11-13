@@ -21,11 +21,22 @@ package xds
 import (
 	"syscall"
 	"testing"
+
+	"github.com/juicedata/juicefs/pkg/chunk"
 )
 
 func TestClientUnsupported(t *testing.T) {
 	c, err := newClient(Config{Service: "xds-test", WorldSize: 1})
 	if c != nil || err != syscall.ENOTSUP {
 		t.Fatalf("newClient: client=%v, err=%v; want nil, ENOTSUP", c, err)
+	}
+}
+
+// Valid Open arguments must reach the unsupported-build stub.
+func TestOpenUnsupported(t *testing.T) {
+	v, err := Open(Config{Service: "xds-test", WorldSize: 1},
+		&volumeTestMeta{}, &volumeTestStore{}, &chunk.Config{BlockSize: 4096})
+	if v != nil || err != syscall.ENOTSUP {
+		t.Fatalf("Open: volume=%v, err=%v; want nil, ENOTSUP", v, err)
 	}
 }
