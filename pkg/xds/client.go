@@ -84,7 +84,10 @@ type result struct {
 
 // ioOp describes one scalar transfer. write=false means blob to buffer;
 // write=true means buffer to blob. All offsets and n are in bytes.
-// The owner must keep the blob and buffer valid until completion.
+// The caller must not modify or concurrently reuse this operation during do.
+// After do returns the operation may be reused, but an EIO from a broken engine
+// does not prove DMA completion: referenced blobs/buffers must remain protected
+// until a successful drain or until teardown establishes that DMA has stopped.
 type ioOp struct {
 	write   bool
 	blob    uintptr
@@ -93,7 +96,14 @@ type ioOp struct {
 	blobOff uint64
 	n       uint64
 
-	// These fields belong to the later I/O engine, not to the C adapter.
-	done   chan error
+	// do initializes these fields before enqueueing; run exclusively owns them
+	// afterward. done is buffered with capacity one. run clears it before sending
+	// the result and never accesses the operation after notification. do waits on
+	// a local channel copy so immediate operation reuse is safe.
+	done chan error
+
+	// expire uses monotonic time and includes admission/queueing time. An
+	// admission timeout has submitted nothing; expiry after enqueue breaks
+	// the engine and quarantines any resources still referenced by DMA.
 	expire time.Time
 }
