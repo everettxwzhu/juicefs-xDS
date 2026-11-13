@@ -46,10 +46,14 @@ type client interface {
 	// registerGPU runs on the caller's current OS thread. Go callers must
 	// LockOSThread before activating the device context and keep it locked
 	// through registration. This method does not take ownership of memory.
+	// An error may follow a successful service operation with a lost reply;
+	// the errno alone does not prove that service state is unchanged.
 	registerGPU(ptr uintptr, size uint64) (ref uint64, err error)
 
 	// unregister is for GPU registrations. The owner must ensure that no
 	// scalar I/O still uses ref; xDS only explicitly tracks vector I/O here.
+	// An error may occur after the service removed ref from its lookup table.
+	// The owner must not make a failed unregister available to readers again.
 	unregister(ref uint64) error
 
 	// submit success means queued, not completed. ENOSPC is returned

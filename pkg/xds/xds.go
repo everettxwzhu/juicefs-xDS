@@ -70,10 +70,11 @@ const (
 // The metadata engine and chunk store are borrowed. Close the Volume before
 // shutting down either dependency; Volume.Close does not close them.
 type Volume struct {
-	// Lifecycle lock: every foreground operation accessing c, e, or tier
-	// must hold RLock for its entire lifetime. Close holds Lock through
-	// teardown; background work follows the admission protocol below.
-	// Registration and cache state will have their own locks in later stages.
+	// Lifecycle lock: Register, Unregister, and every foreground operation
+	// accessing c, e, tier, or regs must hold RLock for its entire lifetime.
+	// Internal helpers assume that lock is already held; never reacquire it
+	// recursively. Close holds Lock through teardown; background work follows
+	// the admission protocol below. Registration state has its own short lock.
 	mu       sync.RWMutex
 	closed   bool
 	closeErr error
@@ -81,6 +82,9 @@ type Volume struct {
 	c    client
 	e    *engine
 	tier *tier
+
+	// Zero-initialized device registry; native registrations belong to c.
+	regs registrationTable
 
 	m     meta.Meta
 	store chunk.ChunkStore
@@ -214,6 +218,12 @@ func (v *Volume) IOUnit() int {
 // Close waits for admitted operations and background workers, then stops the
 // engine before closing its client. It is concurrent-safe and idempotent;
 // repeated calls return the original drain result.
+//
+// Registration calls hold the lifecycle read lock, so they also finish before
+// teardown. Do not wait for registration counters or unregister each record:
+// failures deliberately retain references, and client.close releases the session.
+// A control failure alone does not change Close's result; engine.stop determines
+// whether all submitted DMA was observed complete.
 //
 // EIO means outstanding DMA could not be ruled out. Native client teardown is
 // not a device-memory synchronization barrier; in that case device memory must
