@@ -17,7 +17,9 @@
 package xds
 
 import (
+	"context"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -355,6 +357,155 @@ func TestEngineAdmissionTimeout(t *testing.T) {
 	}
 	if err := e.do(&ioOp{n: 4096}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// engineWaitContext exposes when do starts considering cancellation without
+// sleeping to guess whether a goroutine has reached its admission wait.
+type engineWaitContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *engineWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
+
+func TestEngineCancellationBeforeAdmission(t *testing.T) {
+	for _, congested := range []bool{false, true} {
+		t.Run(map[bool]string{false: "already cancelled", true: "waiting for credit"}[congested], func(t *testing.T) {
+			c := newFakeClient()
+			c.auto = true
+			e := testEngine(t, c, time.Second)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if congested {
+				for i := 0; i < cap(e.credits); i++ {
+					e.credits <- struct{}{}
+				}
+				waitCtx := &engineWaitContext{Context: ctx, observed: make(chan struct{})}
+				done := asyncDo(e, &ioOp{n: 4096, ctx: waitCtx})
+				receive(t, waitCtx.observed)
+				cancel()
+				if err := receive(t, done); err != context.Canceled {
+					t.Fatalf("cancelled admission = %v", err)
+				}
+				for i := 0; i < cap(e.credits); i++ {
+					<-e.credits
+				}
+			} else {
+				cancel()
+				if err := e.do(&ioOp{n: 4096, ctx: ctx}); err != context.Canceled {
+					t.Fatalf("already cancelled admission = %v", err)
+				}
+			}
+			if c.submits.Load() != 0 || e.broken.Load() {
+				t.Fatalf("cancelled admission submitted=%d broken=%v", c.submits.Load(), e.broken.Load())
+			}
+			if err := e.do(&ioOp{n: 4096}); err != nil {
+				t.Fatalf("independent operation after cancellation = %v", err)
+			}
+		})
+	}
+}
+
+func TestEngineCancellationBehindENOSPC(t *testing.T) {
+	c := newFakeClient()
+	c.auto = true
+	first, retry := make(chan struct{}), make(chan struct{})
+	release := make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	var allow atomic.Bool
+	c.reject = func(attempt int64) error {
+		if attempt == 1 {
+			close(first)
+			<-release
+		}
+		if attempt == 2 {
+			close(retry)
+		}
+		if !allow.Load() {
+			return syscall.ENOSPC
+		}
+		return nil
+	}
+	e := testEngine(t, c, 2*time.Second)
+	t.Cleanup(releaseOnce)
+	head := asyncDo(e, &ioOp{n: 4096, ref: 1})
+	receive(t, first)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tail := asyncDo(e, &ioOp{n: 4096, ref: 2, ctx: ctx})
+	// The engine is blocked in the first submit. Wait for the second caller's
+	// actual ingress send; the next loop must consume it before retrying head.
+	deadline := time.Now().Add(time.Second)
+	for len(e.in) != 1 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if len(e.in) != 1 {
+		t.Fatal("tail did not reach ingress")
+	}
+	releaseOnce()
+	receive(t, retry)
+	cancel()
+	if err := receive(t, tail); err != context.Canceled {
+		t.Fatalf("cancelled tail behind a live ENOSPC head = %v", err)
+	}
+	if e.broken.Load() {
+		t.Fatal("cancelling queued work broke the engine")
+	}
+	allow.Store(true)
+	if err := receive(t, head); err != nil {
+		t.Fatalf("independent head = %v", err)
+	}
+	if s := receive(t, c.submitted); s.ref != 1 {
+		t.Fatalf("cancelled operation reached native submit: %+v", s)
+	}
+	select {
+	case s := <-c.submitted:
+		t.Fatalf("unexpected extra submission: %+v", s)
+	default:
+	}
+}
+
+func TestEngineCancellationAfterSubmissionWaitsForCompletion(t *testing.T) {
+	c := newFakeClient()
+	e := testEngine(t, c, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := asyncDo(e, &ioOp{n: 4096, ctx: ctx})
+	s := receive(t, c.submitted)
+	cancel()
+	receive(t, c.expired)
+	select {
+	case err := <-done:
+		t.Fatalf("submitted DMA returned before completion: %v", err)
+	default:
+	}
+	c.ready <- s.result
+	// do reports native completion. ReadAt separately reports the caller's
+	// cancellation after joining its workers; the engine must not break here.
+	if err := receive(t, done); err != nil || e.broken.Load() {
+		t.Fatalf("submitted completion = %v, broken=%v", err, e.broken.Load())
+	}
+}
+
+func TestEngineCancelledQueueDoesNotExpire(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e := &engine{failed: make(chan struct{}), inflight: make(map[uint64]*ioOp)}
+	done := make(chan error, 1)
+	e.push(&ioOp{n: 4096, ctx: ctx, done: done, expire: time.Now().Add(-time.Second)})
+	live := &ioOp{n: 4096, expire: time.Now().Add(time.Second)}
+	e.push(live)
+	e.checkExpired(time.Now())
+	if err := receive(t, done); err != context.Canceled || e.broken.Load() {
+		t.Fatalf("cancelled expired queue = %v, broken=%v", err, e.broken.Load())
+	}
+	if e.queued != 1 || e.pop() != live {
+		t.Fatal("cancellation changed the live FIFO")
 	}
 }
 

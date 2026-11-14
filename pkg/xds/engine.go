@@ -81,8 +81,9 @@ func newEngineWithTimeout(c client, timeout time.Duration) *engine {
 }
 
 // do transfers ownership of op until its result is published. Do not modify or
-// concurrently reuse op during this call. Cancellation belongs above this layer:
-// submitted DMA cannot be cancelled by returning from a Go select.
+// concurrently reuse op during this call. op.ctx may cancel admission or work
+// which the engine has not started submitting. After enqueueing, only the engine
+// may release ownership: submitted DMA cannot be cancelled by a Go select.
 //
 // EIO with broken=true may precede physical completion. The owner must quarantine
 // affected buffers/slots/registrations until drain or teardown; do does not own
@@ -98,6 +99,13 @@ func (e *engine) do(op *ioOp) error {
 	case <-e.stopping:
 		return syscall.EBADF
 	default:
+	}
+	var cancelled <-chan struct{}
+	if op.ctx != nil {
+		if err := op.ctx.Err(); err != nil {
+			return err
+		}
+		cancelled = op.ctx.Done()
 	}
 
 	expire := time.Now().Add(e.timeout)
@@ -115,12 +123,20 @@ func (e *engine) do(op *ioOp) error {
 		case <-e.stopping:
 			timer.Stop()
 			return e.rejected()
+		case <-cancelled:
+			timer.Stop()
+			return op.ctx.Err()
 		case <-timer.C:
 			return syscall.EIO
 		}
 		timer.Stop()
 	}
 	defer func() { <-e.credits }()
+	// Credit availability and cancellation may become ready together. Avoid
+	// publishing a known-cancelled operation even when the credit case won.
+	if err := operationCancelled(op); err != nil {
+		return err
+	}
 
 	done := make(chan error, 1)
 	op.done, op.expire = done, expire
@@ -130,8 +146,12 @@ func (e *engine) do(op *ioOp) error {
 		return syscall.EIO
 	case <-e.stopping:
 		return e.rejected()
+	case <-cancelled:
+		return op.ctx.Err()
 	}
 
+	// Do not select cancelled here. The send above transferred ownership even
+	// if cancellation raced with it; run must acknowledge that no DMA remains.
 	select {
 	case err := <-done:
 		return err
@@ -188,6 +208,29 @@ func (e *engine) pop() *ioOp {
 	return op
 }
 
+func operationCancelled(op *ioOp) error {
+	if op.ctx != nil {
+		return op.ctx.Err()
+	}
+	return nil
+}
+
+// cancelQueued removes cancelled operations throughout the bounded FIFO.
+// Checking only its head would strand a cancelled tail behind ENOSPC retries.
+// Rotate exactly the original count, preserving live operations' order without
+// allocations. run is the sole owner, and must not touch an op after finish.
+// This scan runs with the periodic expiry check, keeping it off the hit path.
+func (e *engine) cancelQueued() {
+	for left := e.queued; left > 0; left-- {
+		op := e.pop()
+		if err := operationCancelled(op); err != nil {
+			finish(op, err)
+		} else {
+			e.push(op)
+		}
+	}
+}
+
 // fail publishes the sticky failure before waking any caller. IDs remain as
 // tombstones until their real completions arrive; no old ioOp pointer is kept.
 func (e *engine) fail() {
@@ -229,6 +272,9 @@ func (e *engine) complete(r result) {
 }
 
 func (e *engine) checkExpired(now time.Time) {
+	// Cancelled, unsubmitted work is safe to discard even after its deadline;
+	// it must not turn one caller's cancellation into a sticky global failure.
+	e.cancelQueued()
 	for i := 0; i < e.queued; i++ {
 		if !now.Before(e.backlog[(e.head+i)%len(e.backlog)].expire) {
 			e.fail()
@@ -302,6 +348,8 @@ func (e *engine) run() {
 				progress = true
 				if draining || e.broken.Load() {
 					finish(op, e.rejected())
+				} else if err := operationCancelled(op); err != nil {
+					finish(op, err)
 				} else {
 					e.push(op)
 				}
@@ -318,10 +366,17 @@ func (e *engine) run() {
 			default:
 			}
 			op := e.backlog[e.head]
+			if err := operationCancelled(op); err != nil {
+				finish(e.pop(), err)
+				progress = true
+				continue
+			}
 			if !time.Now().Before(op.expire) {
 				e.fail()
 				break
 			}
+			// Entering native submit is the cancellation boundary. A successful
+			// submission always enters inflight, even if ctx cancels concurrently.
 			id, err := e.c.submit(op)
 			if errors.Is(err, syscall.ENOSPC) {
 				break // No request was published; retry the same FIFO head.
@@ -388,6 +443,8 @@ func (e *engine) run() {
 		case op := <-e.in:
 			if e.broken.Load() {
 				finish(op, syscall.EIO)
+			} else if err := operationCancelled(op); err != nil {
+				finish(op, err)
 			} else {
 				e.push(op)
 			}

@@ -16,7 +16,10 @@
 
 package xds
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // client adapts the subset of xds/client.h used by this package.
 //
@@ -99,6 +102,12 @@ type ioOp struct {
 	bufOff  uint64
 	blobOff uint64
 	n       uint64
+
+	// ctx cancels admission and queued work only. nil preserves the original
+	// non-cancellable behavior, including zero-slot initialization. Once native
+	// submit starts, completion (or sticky engine failure) is the only ownership
+	// barrier: cancellation must never let the caller recycle live DMA memory.
+	ctx context.Context
 
 	// do initializes these fields before enqueueing; run exclusively owns them
 	// afterward. done is buffered with capacity one. run clears it before sending

@@ -376,10 +376,15 @@ func (t *tier) fill(ctx context.Context, k blockKey, st *stager, sid int32) erro
 	slot := t.ref(sid)
 	if err := t.e.do(&ioOp{
 		write: true, blob: slot.blob, ref: st.ref,
-		blobOff: slot.off, n: uint64(alen),
+		blobOff: slot.off, n: uint64(alen), ctx: ctx,
 	}); err != nil {
 		// An admission timeout has submitted nothing, while a broken engine
 		// may still have live DMA. completeFill/putStager distinguish them.
+		// Preserve cancellation as well: independent singleflight waiters may
+		// retry an abandoned fill instead of inheriting an unrelated EIO.
+		if checkErr := t.check(ctx); checkErr != nil {
+			return checkErr
+		}
 		return syscall.EIO
 	}
 	return nil

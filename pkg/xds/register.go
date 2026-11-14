@@ -206,7 +206,7 @@ func (v *Volume) Unregister(ptr uintptr) error {
 // The caller must already hold Volume.mu.RLock and keep it until all workers
 // using the result have finished. Do not acquire that lock recursively here.
 // A successful call owns exactly one reference, released by releaseRegistration.
-// Request length and file-offset alignment belong to the future ReadAt method;
+// Request length and file-offset alignment belong to the ReadAt method;
 // this helper checks registration-relative address alignment only.
 func (v *Volume) lookup(ptr uintptr, size uint64) (*registration, uint64, error) {
 	t := &v.regs

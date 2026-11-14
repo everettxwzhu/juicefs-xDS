@@ -602,6 +602,51 @@ func TestTierCacheOwnerCancellationAllowsWaiterRetry(t *testing.T) {
 	}
 }
 
+func TestTierCacheQueuedWriteCancellationAllowsWaiterRetry(t *testing.T) {
+	f := newCacheFixture(t, 2, 2, nil)
+	entered := make(chan struct{})
+	var allow atomic.Bool
+	f.c.reject = func(attempt int64) error {
+		if attempt == 1 {
+			close(entered)
+		}
+		if !allow.Load() {
+			return syscall.ENOSPC
+		}
+		return nil
+	}
+	k := cacheTestKey(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	owner := asyncCacheAcquire(f.v, ctx, k)
+	receive(t, entered)
+	waitCtx := &cacheWaitContext{Context: context.Background(), observed: make(chan struct{})}
+	waiter := asyncCacheAcquire(f.v, waitCtx, k)
+	receive(t, waitCtx.observed)
+	cancel()
+	if r := receive(t, owner); r.err != context.Canceled {
+		t.Fatalf("queued fill owner cancellation = %+v", r)
+	}
+	// The owner's CPU read finished, but its NVMe write was never accepted.
+	// The independent waiter must become a fresh owner instead of inheriting
+	// EIO, and both the failed slot and stager must remain reusable.
+	allow.Store(true)
+	r := receive(t, waiter)
+	if r.err != nil {
+		t.Fatalf("independent waiter after queued write cancellation = %+v", r)
+	}
+	releaseCache(f.v, r.sid)
+	if f.v.e.broken.Load() || f.store.reads.Load() != 2 || len(f.v.tier.stagers) != 2 {
+		t.Fatalf("broken=%v reads=%d stagers=%d", f.v.e.broken.Load(), f.store.reads.Load(), len(f.v.tier.stagers))
+	}
+	_ = receive(t, f.c.submitted)
+	select {
+	case s := <-f.c.submitted:
+		t.Fatalf("cancelled fill submitted an extra write: %+v", s)
+	default:
+	}
+}
+
 // waitForCacheSlotWaiter observes the allocator's actual wait predicate rather
 // than guessing when another goroutine has run. No sleep is used to order work.
 func waitForCacheSlotWaiter(t *testing.T, tr *tier) {

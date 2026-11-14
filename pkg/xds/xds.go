@@ -14,14 +14,6 @@
  * limitations under the License.
  */
 
-// Package xds provides the in-process client adapter for xDS GPU reads.
-//
-// The native client is enabled only on Linux with cgo and the xds build tag.
-// Other builds use a stub and do not require the xDS submodule.
-//
-// Build with make juicefs.xds to include the external native sources and
-// headers in cgo's cache key. Client changes are then rebuilt automatically,
-// without clearing the Go build cache or forcing all dependencies to rebuild.
 package xds
 
 import (
