@@ -33,6 +33,8 @@
 // initializes the zero slot before returning. The metadata engine and chunk
 // store are borrowed: close the Volume before closing either dependency.
 // Construct Volumes with Open and do not copy them after first use.
+// Open snapshots cc.MaxRetries as the additional source-read retry budget;
+// zero disables retries. The CLI supplies its io-retries setting (default 10).
 //
 // [Volume.IOUnit] reports the service's byte alignment unit. This immutable
 // value remains available after Close.
@@ -44,13 +46,15 @@
 //
 // [Volume.ReadAt] synchronously reads an open file into a registered device
 // range. [Volume.Close] waits for admitted operations and background work,
-// drains the engine, and releases the session's resources. Close is concurrent
-// safe and idempotent; repeated calls return the original drain result.
+// drains the engine, synchronously unregisters remaining device allocations,
+// then disconnects the client. Close is concurrent safe and idempotent; repeated
+// calls return the original teardown result.
 //
 // The normal sequence is Open, Register, ReadAt (repeated as needed),
-// Unregister, then Close. Close also tears down remaining registrations, so
-// individual Unregister calls are optional when closing the whole Volume.
-// The application retains ownership of its device allocations throughout.
+// Unregister, then Close. A successful Close acknowledges revocation of all
+// remaining registrations, so individual Unregister calls are optional when
+// closing the whole Volume. The application retains ownership of its device
+// allocations throughout.
 //
 // # Examples
 //
@@ -59,7 +63,7 @@
 // aligned request size with IOUnit, register memory, open a readable file,
 // synchronize, read, unregister, and close. It reports the operation error and
 // Close error separately, so an ordinary read failure is not confused with a
-// failure to drain DMA.
+// failure to drain DMA or revoke device mappings.
 //
 // The example attached to [Volume.ReadAt] reuses an existing registration for
 // sequential batches. It waits for previous device work before overwriting the
@@ -109,6 +113,14 @@
 // untouched. Other failures return (0, errno), although some destination bytes
 // may already have changed; discard that request's result.
 //
+// Only source-read failures are retried, up to cc.MaxRetries additional times.
+// Each retry waits for the previous attempt's workers and DMA, invalidates all
+// covered chunk mappings, and replans the entire valid range. This can recover
+// both transient storage failures and obsolete slice mappings after compaction.
+// Backoff follows VFS: 1 ms initially, then 300 ms increments, with 10 s waits
+// from retry 30 onward. Waiting responds to cancellation. Metadata errors,
+// DMA errors, and sticky device failures do not trigger source-read retries.
+//
 // Cancellation skips operations whose native submission has not started and
 // waits for already submitted DMA before returning EINTR. A concurrent native
 // submission may already be committed. Sticky device failure is the exception
@@ -131,10 +143,13 @@
 // registration ownership when physical DMA completion cannot be assumed.
 //
 // Keep device allocations alive until successful Unregister or successful
-// Close. If Close returns EIO, outstanding DMA could not be ruled out: retain
-// the allocation until the service has exited or another mechanism proves DMA
-// has stopped. Native client teardown alone is not a device synchronization
-// barrier. The engine drain timeout does not bound the entire Close call.
+// Close. Close succeeds only after DMA drain and synchronous acknowledgement
+// of every remaining device unregister. A previous registration-control failure
+// or any unregister error makes Close return EIO, even if DMA has drained.
+// If Close returns EIO, retain the allocation until the service has exited or
+// another mechanism confirms both DMA completion and P2P mapping revocation.
+// Socket disconnect only schedules asynchronous service cleanup; it is not a
+// revocation barrier. The engine drain timeout does not bound the entire Close.
 //
 // # Build support
 //

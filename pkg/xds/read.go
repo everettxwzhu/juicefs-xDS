@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -32,6 +33,15 @@ import (
 // buffers, even when a large BlockSize leaves only one stager. The engine has
 // its own admission bound shared by all concurrent ReadAt calls.
 const maxReadWorkers = 32
+
+// sourceReadError distinguishes retryable chunk-reader failures from metadata
+// errno values and DMA/admission failures, which can also be EIO. Keep the marker
+// through shared cache-fill errors; readResultError exposes only syscall.EIO.
+// The zero-sized value adds no allocation to the failed-fill path.
+type sourceReadError struct{}
+
+func (sourceReadError) Error() string { return syscall.EIO.Error() }
+func (sourceReadError) Unwrap() error { return syscall.EIO }
 
 // ReadAt reads file data into caller-owned, previously registered device memory.
 // f must be an open, readable regular file belonging to this Volume. Its open
@@ -53,6 +63,9 @@ const maxReadWorkers = 32
 // skips operations not yet being submitted and waits for submitted DMA before
 // returning EINTR. Sticky device failure returns EIO and retains registration
 // ownership until Close: an error alone cannot prove physical DMA completion.
+// Source-read failures retry up to the snapshotted cc.MaxRetries budget, after
+// invalidating chunk mappings and replanning. Each retry rewrites the whole range
+// only after all previous workers and submitted DMA have finished.
 //
 // The caller must finish device work touching this range before the call and
 // keep its allocation alive. Observe the backend's device synchronization rules;
@@ -106,20 +119,80 @@ func (v *Volume) ReadAt(ctx meta.Context, f *fs.File, ptr uintptr, size int, off
 	if off >= fileLen {
 		return 0, io.EOF
 	}
-	windows, planned, err := v.plan(ctx, f.Inode(), uint64(fileLen), uint64(off), uint64(size))
-	if err != nil {
-		return 0, err
+	for retries := 0; ; retries++ {
+		if err := v.checkRead(ctx); err != nil {
+			return 0, err
+		}
+		windows, planned, err := v.plan(ctx, f.Inode(), uint64(fileLen), uint64(off), uint64(size))
+		if err != nil {
+			return 0, err // Metadata errors, including EIO, are not source errors.
+		}
+		err = v.executeWindows(ctx, reg, dstBase, windows)
+		// executeWindows joins every worker even when one fails. Never start a
+		// new attempt while a previous DMA can still reference the destination.
+		if checkErr := v.checkRead(ctx); checkErr != nil {
+			return 0, checkErr
+		}
+		if err == nil {
+			// Admission must finish under our lifecycle lock. Prefetch workers
+			// use Volume.bg, never reacquire mu, and are cancelled/joined by Close.
+			v.prefetchRead(ctx, windows)
+			return int(planned), nil // plan clips to size, already an int.
+		}
+		var sourceErr sourceReadError
+		if !errors.As(err, &sourceErr) || retries >= v.maxRetries {
+			return 0, err
+		}
+		// A missing old object can mean another client compacted the chunk and
+		// deleted its obsolete slice. Retrying the same block key cannot recover;
+		// invalidate every covered chunk and obtain a fresh mapping next time.
+		if err := v.invalidateReadChunks(ctx, f.Inode(), uint64(off), planned); err != nil {
+			return 0, err
+		}
+		if err := v.waitReadRetry(ctx, retries+1); err != nil {
+			return 0, err
+		}
 	}
-	if err := v.executeWindows(ctx, reg, dstBase, windows); err != nil {
-		return 0, err
+}
+
+// invalidateReadChunks uses the valid file range, not the caller's larger EOF
+// buffer. plan has already checked these chunk indices and off+n <= fileLen.
+// Preserve meta.Context identity and errno values just as during planning.
+func (v *Volume) invalidateReadChunks(ctx meta.Context, ino meta.Ino, off, n uint64) error {
+	if n == 0 {
+		return nil
 	}
-	if err := v.checkRead(ctx); err != nil {
-		return 0, err
+	last := (off + n - 1) / meta.ChunkSize
+	for indx := off / meta.ChunkSize; indx <= last; indx++ {
+		if err := v.checkRead(ctx); err != nil {
+			return err
+		}
+		if eno := v.m.InvalidateChunkCache(ctx, ino, uint32(indx)); eno != 0 {
+			return eno
+		}
 	}
-	// Admission must finish under our lifecycle lock. Prefetch workers use
-	// Volume.bg, never reacquire mu, and are cancelled/joined by Close.
-	v.prefetchRead(ctx, windows)
-	return int(planned), nil // plan clips to size, which is already an int.
+	return nil
+}
+
+// Match vfs.retry_time without exporting a VFS implementation detail: the first
+// retry waits 1 ms, later waits grow by 300 ms, and retry 30 onward waits 10 s.
+// Check the cap before arithmetic so even very large retry budgets are safe.
+func readRetryDelay(retry int) time.Duration {
+	if retry >= 30 {
+		return 10 * time.Second
+	}
+	return time.Duration((retry-1)*300+1) * time.Millisecond
+}
+
+func (v *Volume) waitReadRetry(ctx context.Context, retry int) error {
+	timer := time.NewTimer(readRetryDelay(retry))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	case <-v.e.failed:
+	}
+	return v.checkRead(ctx)
 }
 
 // checkRead is used only while the foreground caller holds the lifecycle read
@@ -272,7 +345,7 @@ func (v *Volume) readAssembledWindow(ctx context.Context, reg *registration, dst
 			if checkErr := v.checkRead(ctx); checkErr != nil {
 				return checkErr
 			}
-			return syscall.EIO
+			return sourceReadError{}
 		}
 		copy(dst, page.Data)
 		page.Release()

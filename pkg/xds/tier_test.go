@@ -19,6 +19,7 @@ package xds
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"runtime"
 	"sync"
@@ -557,7 +558,11 @@ func TestTierCacheSharesFillFailure(t *testing.T) {
 	}
 	releaseRead()
 	for _, ch := range append(waiters, owner) {
-		if r := receive(t, ch); r.err != syscall.EIO {
+		r := receive(t, ch)
+		var sourceErr sourceReadError
+		// Every waiter must preserve both public EIO classification and the
+		// internal source marker, so each foreground read may refresh metadata.
+		if !errors.Is(r.err, syscall.EIO) || !errors.As(r.err, &sourceErr) {
 			t.Fatalf("shared fill failure = %+v", r)
 		}
 	}

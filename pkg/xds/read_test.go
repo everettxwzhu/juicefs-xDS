@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/fs"
@@ -75,9 +76,11 @@ func (c *readDeviceClient) deviceBytes(ref uint64) []byte {
 // constructors for fs.File or depending on a particular writer's compaction.
 type readTestMeta struct {
 	meta.Meta
-	slices map[uint32][]meta.Slice
-	err    syscall.Errno
-	reads  atomic.Int32
+	slices        map[uint32][]meta.Slice
+	err           syscall.Errno
+	reads         atomic.Int32
+	invalidations atomic.Int32
+	onInvalidate  func(meta.Context, meta.Ino, uint32) syscall.Errno
 }
 
 func (m *readTestMeta) Read(_ meta.Context, _ meta.Ino, indx uint32, out *[]meta.Slice) syscall.Errno {
@@ -87,6 +90,14 @@ func (m *readTestMeta) Read(_ meta.Context, _ meta.Ino, indx uint32, out *[]meta
 	}
 	*out = m.slices[indx]
 	return 0
+}
+
+func (m *readTestMeta) InvalidateChunkCache(ctx meta.Context, ino meta.Ino, indx uint32) syscall.Errno {
+	m.invalidations.Add(1)
+	if m.onInvalidate != nil {
+		return m.onInvalidate(ctx, ino, indx)
+	}
+	return m.Meta.InvalidateChunkCache(ctx, ino, indx)
 }
 
 type readFixture struct {
@@ -169,6 +180,9 @@ func newReadFixture(t testing.TB, fileLen uint64, slices map[uint32][]meta.Slice
 	}
 	t.Cleanup(func() { _ = f.Close(meta.Background()) })
 	cache, device, ptr, ref := attachReadDevice(t, m, store, store)
+	// File construction may invalidate metadata during truncate. Only count
+	// recovery invalidations performed by the ReadAt operation under test.
+	m.invalidations.Store(0)
 	return &readFixture{cacheFixture: cache, device: device, m: m, file: f, ptr: ptr, ref: ref}
 }
 
@@ -361,6 +375,218 @@ func TestReadAtErrors(t *testing.T) {
 	}
 }
 
+func TestReadAtStorageRetry(t *testing.T) {
+	for _, assembled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "direct", true: "assembled"}[assembled], func(t *testing.T) {
+			data := readPattern(2*cacheTestBlockSize, 71)
+			s := meta.Slice{Id: 1, Size: uint32(len(data)), Len: cacheTestBlockSize}
+			if assembled {
+				s.Off = 1
+			}
+			f := newReadFixture(t, cacheTestBlockSize, map[uint32][]meta.Slice{0: {s}}, map[uint64][]byte{1: data})
+			f.v.maxRetries = 1
+			f.store.onRead = func(context.Context, uint64, int) error {
+				if f.store.reads.Load() == 1 {
+					return errors.New("temporary object read failure")
+				}
+				return nil
+			}
+			n, err := f.v.ReadAt(meta.Background(), f.file, f.ptr, cacheTestBlockSize, 0)
+			if n != cacheTestBlockSize || err != nil {
+				t.Fatalf("recovered ReadAt=(%d,%v)", n, err)
+			}
+			wantReads := int32(2)
+			if assembled {
+				// The successful assembled attempt reads two pieces separated by
+				// a source-block boundary; the failed attempt reads only the first.
+				wantReads++
+			}
+			if f.store.reads.Load() != wantReads || f.m.reads.Load() != 2 || f.m.invalidations.Load() != 1 {
+				t.Fatalf("storage reads=%d plans=%d invalidations=%d", f.store.reads.Load(), f.m.reads.Load(), f.m.invalidations.Load())
+			}
+			if f.v.e.broken.Load() || len(f.v.tier.stagers) != 2 {
+				t.Fatal("recoverable storage failure broke the engine or retained its stager")
+			}
+			checkReadDevice(t, f.device, f.ref, 0, data[int(s.Off):int(s.Off)+n], f.v.IOUnit())
+		})
+	}
+}
+
+func TestReadAtRetryInvalidatesAndReplans(t *testing.T) {
+	data := readPattern(cacheTestBlockSize, 101)
+	f := newReadFixture(t, cacheTestBlockSize,
+		map[uint32][]meta.Slice{0: {{Id: 1, Size: cacheTestBlockSize, Len: cacheTestBlockSize}}},
+		map[uint64][]byte{2: data})
+	f.v.maxRetries = 1
+	f.store.onRead = func(_ context.Context, id uint64, _ int) error {
+		if id == 1 {
+			return errors.New("old slice was removed after compaction")
+		}
+		return nil
+	}
+	f.m.onInvalidate = func(_ meta.Context, ino meta.Ino, indx uint32) syscall.Errno {
+		if ino != f.file.Inode() || indx != 0 {
+			t.Errorf("invalidated inode=%d chunk=%d", ino, indx)
+		}
+		// This mutation is sequenced after all failed-attempt workers joined.
+		// Reusing the old windows would continue asking for the missing slice.
+		f.m.slices[0] = []meta.Slice{{Id: 2, Size: cacheTestBlockSize, Len: cacheTestBlockSize}}
+		return 0
+	}
+	n, err := f.v.ReadAt(meta.Background(), f.file, f.ptr, cacheTestBlockSize, 0)
+	if n != cacheTestBlockSize || err != nil {
+		t.Fatalf("replanned ReadAt=(%d,%v)", n, err)
+	}
+	if f.store.reads.Load() != 2 || f.m.reads.Load() != 2 || f.m.invalidations.Load() != 1 {
+		t.Fatalf("reads=%d plans=%d invalidations=%d; expected one fresh plan", f.store.reads.Load(), f.m.reads.Load(), f.m.invalidations.Load())
+	}
+	checkReadDevice(t, f.device, f.ref, 0, data, f.v.IOUnit())
+}
+
+func TestReadAtRetryInvalidatesCrossChunkRange(t *testing.T) {
+	const n = 1024
+	first, second := readPattern(n, 103), readPattern(n, 107)
+	f := newReadFixture(t, meta.ChunkSize+cacheTestBlockSize,
+		map[uint32][]meta.Slice{
+			0: {{Len: meta.ChunkSize - n}, {Id: 1, Size: n, Len: n}},
+			1: {{Id: 2, Size: n, Len: n}},
+		}, map[uint64][]byte{1: first, 2: second})
+	f.v.maxRetries = 1
+	f.store.onRead = func(context.Context, uint64, int) error {
+		if f.store.reads.Load() == 1 {
+			return errors.New("temporary read failure at the previous chunk tail")
+		}
+		return nil
+	}
+	ctx := meta.NewContext(42, 7, []uint32{9})
+	var invalidated []uint32
+	f.m.onInvalidate = func(got meta.Context, ino meta.Ino, indx uint32) syscall.Errno {
+		if got != ctx || got.Uid() != 7 || got.Gid() != 9 || ino != f.file.Inode() {
+			t.Errorf("metadata recovery changed caller context or inode: uid=%d gid=%d inode=%d", got.Uid(), got.Gid(), ino)
+		}
+		invalidated = append(invalidated, indx)
+		return 0
+	}
+	got, err := f.v.ReadAt(ctx, f.file, f.ptr, 2*n, meta.ChunkSize-n)
+	if got != 2*n || err != nil {
+		t.Fatalf("cross-chunk retry=(%d,%v)", got, err)
+	}
+	if len(invalidated) != 2 || invalidated[0] != 0 || invalidated[1] != 1 ||
+		f.m.reads.Load() != 4 || f.store.reads.Load() != 3 {
+		t.Fatalf("invalidated=%v plans=%d source reads=%d", invalidated, f.m.reads.Load(), f.store.reads.Load())
+	}
+	checkReadDevice(t, f.device, f.ref, 0, append(bytes.Clone(first), second...), f.v.IOUnit())
+}
+
+func TestReadAtRetryExhausted(t *testing.T) {
+	f := newReadFixture(t, cacheTestBlockSize,
+		map[uint32][]meta.Slice{0: {{Id: 1, Size: cacheTestBlockSize, Len: cacheTestBlockSize}}},
+		map[uint64][]byte{1: readPattern(cacheTestBlockSize, 113)})
+	f.v.maxRetries = 1
+	f.store.onRead = func(context.Context, uint64, int) error { return errors.New("object remains unavailable") }
+	if n, err := f.v.ReadAt(meta.Background(), f.file, f.ptr, cacheTestBlockSize, 0); n != 0 || err != syscall.EIO {
+		t.Fatalf("exhausted ReadAt=(%d,%v)", n, err)
+	}
+	if f.store.reads.Load() != 2 || f.m.reads.Load() != 2 || f.m.invalidations.Load() != 1 {
+		t.Fatalf("reads=%d plans=%d invalidations=%d; maxRetries=1 must allow exactly two attempts", f.store.reads.Load(), f.m.reads.Load(), f.m.invalidations.Load())
+	}
+	if f.c.submits.Load() != 0 || f.v.e.broken.Load() {
+		t.Fatal("source failures issued DMA or broke the engine")
+	}
+	if err := f.v.Unregister(f.ptr); err != nil {
+		t.Fatalf("exhausted source retries retained registration: %v", err)
+	}
+}
+
+func TestReadAtRetryCancellation(t *testing.T) {
+	f := newReadFixture(t, cacheTestBlockSize,
+		map[uint32][]meta.Slice{0: {{Id: 1, Size: cacheTestBlockSize, Len: cacheTestBlockSize}}},
+		map[uint64][]byte{1: readPattern(cacheTestBlockSize, 127)})
+	f.v.maxRetries = 10
+	f.store.onRead = func(context.Context, uint64, int) error { return errors.New("temporary object failure") }
+	ctx := meta.Background()
+	f.m.onInvalidate = func(_ meta.Context, _ meta.Ino, _ uint32) syscall.Errno {
+		// Recovery has joined the failed attempt and reached its retry boundary.
+		// Cancellation here must prevent backoff from starting another GET.
+		ctx.Cancel()
+		return 0
+	}
+	if n, err := f.v.ReadAt(ctx, f.file, f.ptr, cacheTestBlockSize, 0); n != 0 || err != syscall.EINTR {
+		t.Fatalf("cancelled retry=(%d,%v)", n, err)
+	}
+	if f.store.reads.Load() != 1 || f.m.reads.Load() != 1 || f.m.invalidations.Load() != 1 {
+		t.Fatalf("cancelled retry performed more work: reads=%d plans=%d invalidations=%d", f.store.reads.Load(), f.m.reads.Load(), f.m.invalidations.Load())
+	}
+	if err := f.v.Unregister(f.ptr); err != nil {
+		t.Fatalf("cancelled source retry retained registration: %v", err)
+	}
+}
+
+func TestReadRetryBackoffCancellation(t *testing.T) {
+	f := newCacheFixture(t, 2, 2, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observed := &cacheWaitContext{Context: ctx, observed: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		f.v.mu.RLock()
+		defer f.v.mu.RUnlock()
+		// The capped retry would otherwise wait ten seconds. Observing Done
+		// guarantees cancellation occurs after constructing the wait select.
+		done <- f.v.waitReadRetry(observed, 30)
+	}()
+	receive(t, observed.observed)
+	cancel()
+	if err := receive(t, done); err != context.Canceled {
+		t.Fatalf("cancelled retry backoff=%v", err)
+	}
+}
+
+func TestReadRetryDelay(t *testing.T) {
+	for _, tc := range []struct {
+		retry int
+		want  time.Duration
+	}{
+		{1, time.Millisecond},
+		{2, 301 * time.Millisecond},
+		{29, 8401 * time.Millisecond},
+		{30, 10 * time.Second},
+		{31, 10 * time.Second},
+		{int(^uint(0) >> 1), 10 * time.Second},
+	} {
+		if got := readRetryDelay(tc.retry); got != tc.want {
+			t.Errorf("readRetryDelay(%d)=%s; want %s", tc.retry, got, tc.want)
+		}
+	}
+}
+
+func TestReadAtMetadataFailureDoesNotRetry(t *testing.T) {
+	f := newReadFixture(t, cacheTestBlockSize, nil, nil)
+	f.v.maxRetries = 2
+	f.m.err = syscall.EIO
+	if n, err := f.v.ReadAt(meta.Background(), f.file, f.ptr, cacheTestBlockSize, 0); n != 0 || err != syscall.EIO {
+		t.Fatalf("metadata failure=(%d,%v)", n, err)
+	}
+	if f.m.reads.Load() != 1 || f.m.invalidations.Load() != 0 || f.store.reads.Load() != 0 {
+		t.Fatal("metadata EIO was mistaken for a retryable object read failure")
+	}
+}
+
+func TestReadAtInvalidationFailureStopsRetry(t *testing.T) {
+	f := newReadFixture(t, cacheTestBlockSize,
+		map[uint32][]meta.Slice{0: {{Id: 1, Size: cacheTestBlockSize, Len: cacheTestBlockSize}}},
+		map[uint64][]byte{1: readPattern(cacheTestBlockSize, 131)})
+	f.v.maxRetries = 2
+	f.store.onRead = func(context.Context, uint64, int) error { return errors.New("temporary object failure") }
+	f.m.onInvalidate = func(meta.Context, meta.Ino, uint32) syscall.Errno { return syscall.EACCES }
+	if n, err := f.v.ReadAt(meta.Background(), f.file, f.ptr, cacheTestBlockSize, 0); n != 0 || err != syscall.EACCES {
+		t.Fatalf("failed invalidation=(%d,%v)", n, err)
+	}
+	if f.store.reads.Load() != 1 || f.m.reads.Load() != 1 || f.m.invalidations.Load() != 1 {
+		t.Fatal("failed metadata invalidation did not terminate recovery")
+	}
+}
+
 func TestReadAtEmptyAndForeignFile(t *testing.T) {
 	empty := newReadFixture(t, 0, nil, nil)
 	other := newReadFixture(t, cacheTestBlockSize, nil, nil)
@@ -423,6 +649,12 @@ func TestReadAtCancellationWaitsForDMAAndClose(t *testing.T) {
 	if err := f.v.Unregister(f.ptr); err != syscall.EBUSY {
 		t.Fatalf("Unregister during cancelled DMA=%v", err)
 	}
+	// Close removes the fake's registration map entry after the read exits.
+	// Retain the test-owned Go backing array solely for post-close assertions;
+	// real device allocations still obey ReadAt's native-lifetime contract.
+	f.c.mu.Lock()
+	deviceBytes := f.c.buffers[f.ref]
+	f.c.mu.Unlock()
 	closed := make(chan error, 1)
 	go func() { closed <- f.v.Close() }()
 	select {
@@ -437,7 +669,10 @@ func TestReadAtCancellationWaitsForDMAAndClose(t *testing.T) {
 	if err := receive(t, closed); err != nil {
 		t.Fatal(err)
 	}
-	checkReadDevice(t, f.device, f.ref, 0, data, f.v.IOUnit())
+	if !bytes.Equal(deviceBytes[:len(data)], data) ||
+		!bytes.Equal(deviceBytes[len(data):], bytes.Repeat([]byte{0x7d}, len(deviceBytes)-len(data))) {
+		t.Fatal("cancelled DMA was not completed correctly before Close unregistered its buffer")
+	}
 }
 
 func TestReadAtCancellationAfterScratchWrite(t *testing.T) {
@@ -525,6 +760,7 @@ func TestReadAtBrokenQuarantinesResources(t *testing.T) {
 			}
 			f := newReadFixture(t, 1024, map[uint32][]meta.Slice{0: {s}},
 				map[uint64][]byte{1: readPattern(cacheTestBlockSize, 53)})
+			f.v.maxRetries = 2
 			sid := int32(-1)
 			if !assembled {
 				got := cacheAcquire(f.v, context.Background(), cacheTestKey(1))
@@ -541,6 +777,9 @@ func TestReadAtBrokenQuarantinesResources(t *testing.T) {
 			f.c.badPoll.Store(true)
 			if r := receive(t, done); r.n != 0 || r.err != syscall.EIO {
 				t.Fatalf("broken read=%+v", r)
+			}
+			if f.m.reads.Load() != 1 || f.m.invalidations.Load() != 0 {
+				t.Fatal("broken DMA attempted metadata invalidation or replanning")
 			}
 			if err := f.v.Unregister(f.ptr); err != syscall.EBUSY {
 				t.Fatalf("broken registration was released: %v", err)

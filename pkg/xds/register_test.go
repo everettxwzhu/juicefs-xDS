@@ -55,7 +55,7 @@ func (c *registrationClient) unregister(ref uint64) error {
 func registrationVolume(t *testing.T) (*Volume, *registrationClient) {
 	t.Helper()
 	c := &registrationClient{volumeClient: newVolumeClient()}
-	v, err := openVolume(c, &volumeTestMeta{}, &volumeTestStore{}, 4096, 8192)
+	v, err := openVolume(c, &volumeTestMeta{}, &volumeTestStore{}, 4096, 8192, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,9 +262,11 @@ func TestUnregisterClosingAllowsOtherLookups(t *testing.T) {
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
 	defer unblock()
-	c.onUnregister = func(uint64) error {
-		close(entered)
-		<-release
+	c.onUnregister = func(ref uint64) error {
+		if ref == 1001 {
+			close(entered)
+			<-release
+		}
 		return nil
 	}
 	done := make(chan error, 1)
@@ -350,11 +352,12 @@ func TestRegistrationNativeFailureQuarantines(t *testing.T) {
 			if err := v.Unregister(0x10000); err != syscall.EBUSY {
 				t.Fatalf("unregister after failure: %v", err)
 			}
-			if err := v.Close(); err != nil {
-				t.Fatalf(
-					"quarantined bookkeeping must not prevent a confirmed drain: %v",
-					err,
-				)
+			unregisterCalls := c.unregisterCalls.Load()
+			if err := v.Close(); err != syscall.EIO {
+				t.Fatalf("uncertain control state must prevent confirmed revocation: %v", err)
+			}
+			if c.unregisterCalls.Load() != unregisterCalls {
+				t.Fatal("Close reused a failed control connection")
 			}
 		})
 	}
@@ -386,6 +389,157 @@ func TestRegistrationEngineFailureKeepsPin(t *testing.T) {
 	}
 	if _, _, err := registrationLookup(v, 0x10000, 4096); err != syscall.EIO {
 		t.Fatalf("lookup with broken engine: %v", err)
+	}
+	// The failing submission published no DMA. stop can still prove a clean
+	// drain, so Close must revoke the device despite the retained read counter
+	// and sticky engine state which make public Unregister reject this record.
+	if err := v.Close(); err != nil || c.unregisterCalls.Load() != 1 {
+		t.Fatalf("Close after confirmed broken-engine drain = %v, unregister calls=%d", err, c.unregisterCalls.Load())
+	}
+	if len(v.regs.entries) != 0 {
+		t.Fatal("Close retained an acknowledged device registration")
+	}
+}
+
+func TestRegistrationCloseSynchronouslyRevokes(t *testing.T) {
+	v, c := registrationVolume(t)
+	for _, ptr := range []uintptr{0x30000, 0x10000, 0x20000} {
+		if err := v.Register(ptr, 4096); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An explicitly removed record must not be revoked a second time by Close.
+	if err := v.Unregister(0x20000); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	events := make(chan string, 3)
+	c.onUnregister = func(ref uint64) error {
+		select {
+		case <-v.e.exited:
+		default:
+			t.Error("device unregister preceded engine drain")
+		}
+		events <- fmt.Sprintf("unregister %d", ref)
+		if ref == 1002 {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	c.onClose = func() { events <- "close" }
+	done := make(chan error, 1)
+	go func() { done <- v.Close() }()
+	receive(t, entered)
+	select {
+	case err := <-done:
+		t.Fatalf("Close returned before synchronous revocation: %v", err)
+	default:
+	}
+	if c.closes.Load() != 0 {
+		t.Fatal("native client closed before device revocation acknowledgement")
+	}
+	unblock()
+	if err := receive(t, done); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"unregister 1002", "unregister 1001", "close"} {
+		if got := receive(t, events); got != want {
+			t.Fatalf("teardown event=%q; want %q", got, want)
+		}
+	}
+	if len(v.regs.entries) != 0 || c.unregisterCalls.Load() != 3 || c.closes.Load() != 1 {
+		t.Fatalf("remaining=%d unregisters=%d closes=%d", len(v.regs.entries), c.unregisterCalls.Load(), c.closes.Load())
+	}
+	if err := v.Close(); err != nil || c.unregisterCalls.Load() != 3 || c.closes.Load() != 1 {
+		t.Fatalf("repeated Close=%v unregisters=%d closes=%d", err, c.unregisterCalls.Load(), c.closes.Load())
+	}
+}
+
+func TestRegistrationCloseRevocationFailure(t *testing.T) {
+	v, c := registrationVolume(t)
+	for _, ptr := range []uintptr{0x10000, 0x20000, 0x30000} {
+		if err := v.Register(ptr, 4096); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var revoked []uint64
+	c.onUnregister = func(ref uint64) error {
+		revoked = append(revoked, ref)
+		if ref == 1002 {
+			return syscall.EACCES
+		}
+		return nil
+	}
+	if err := v.Close(); err != syscall.EIO {
+		t.Fatalf("uncertain device revocation = %v", err)
+	}
+	if len(revoked) != 2 || revoked[0] != 1001 || revoked[1] != 1002 {
+		t.Fatalf("RPCs continued after a failed revocation: %v", revoked)
+	}
+	if !v.regs.failed.Load() || len(v.regs.entries) != 2 || v.regs.entries[0].ref != 1002 {
+		t.Fatal("acknowledged record was retained or uncertain records were discarded")
+	}
+	if err := v.Close(); err != syscall.EIO || c.unregisterCalls.Load() != 2 || c.closes.Load() != 1 {
+		t.Fatalf("repeated Close=%v unregisters=%d closes=%d", err, c.unregisterCalls.Load(), c.closes.Load())
+	}
+}
+
+func TestRegistrationCloseAfterControlFailure(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(map[bool]string{false: "empty registry", true: "existing registration"}[existing], func(t *testing.T) {
+			v, c := registrationVolume(t)
+			if existing {
+				if err := v.Register(0x10000, 4096); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A lost native reply may hide a successful service registration.
+			// Even an empty local table must not turn socket close into proof
+			// that the allocation is no longer accessible by the service.
+			c.onRegister = func(uintptr, uint64) (uint64, error) {
+				return 0, syscall.ETIMEDOUT
+			}
+			if err := v.Register(0x20000, 4096); err != syscall.ETIMEDOUT {
+				t.Fatal(err)
+			}
+			if err := v.Close(); err != syscall.EIO || c.unregisterCalls.Load() != 0 || c.closes.Load() != 1 {
+				t.Fatalf("Close after failed control=%v unregisters=%d closes=%d", err, c.unregisterCalls.Load(), c.closes.Load())
+			}
+			if err := v.Close(); err != syscall.EIO || c.closes.Load() != 1 {
+				t.Fatalf("repeated Close after failed control=%v closes=%d", err, c.closes.Load())
+			}
+		})
+	}
+}
+
+func TestRegistrationCloseAfterUncertainDrain(t *testing.T) {
+	v, c := registrationVolume(t)
+	if err := v.Register(0x10000, 4096); err != nil {
+		t.Fatal(err)
+	}
+	// Replace only the idle engine to shorten this fault-injection deadline.
+	// No tier reads or prefetches are active in this registry-only fixture.
+	if err := v.e.stop(); err != nil {
+		t.Fatal(err)
+	}
+	for len(c.submitted) != 0 {
+		<-c.submitted
+	}
+	c.complete = false
+	v.e = newEngineWithTimeout(c, 30*time.Millisecond)
+	done := asyncDo(v.e, &ioOp{blob: 101, ref: 201, n: 4096})
+	_ = receive(t, c.submitted)
+	if err := v.Close(); err != syscall.EIO {
+		t.Fatalf("Close with unconfirmed DMA = %v", err)
+	}
+	if err := receive(t, done); err != syscall.EIO {
+		t.Fatalf("incomplete DMA = %v", err)
+	}
+	if c.unregisterCalls.Load() != 0 || len(v.regs.entries) != 1 || c.closes.Load() != 1 {
+		t.Fatalf("unregisters=%d remaining=%d closes=%d", c.unregisterCalls.Load(), len(v.regs.entries), c.closes.Load())
 	}
 }
 

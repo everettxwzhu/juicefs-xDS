@@ -136,7 +136,7 @@ func (c *volumeClient) close() {
 
 func openTestVolume(t *testing.T, c *volumeClient) *Volume {
 	t.Helper()
-	v, err := openVolume(c, &volumeTestMeta{}, &volumeTestStore{}, 4096, 8192)
+	v, err := openVolume(c, &volumeTestMeta{}, &volumeTestStore{}, 4096, 8192, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestVolumeOpen(t *testing.T) {
 		t.Fatalf("gets=%d allocs=%d slots=%d cacheStart=%d stagers=%d",
 			c.gets, c.allocs, len(v.tier.slots), v.tier.cacheStart, len(v.tier.stagers))
 	}
-	if v.blockSize != 4096 || v.readahead != 8192 || v.IOUnit() != 4096 ||
+	if v.blockSize != 4096 || v.readahead != 8192 || v.maxRetries != 3 || v.IOUnit() != 4096 ||
 		v.gpuBufferSize != c.cm.gpuBufferSize {
 		t.Fatal("configuration or metadata snapshot is incorrect")
 	}
@@ -190,7 +190,7 @@ func TestVolumeOpenWaitsForZeroSlot(t *testing.T) {
 	}
 	done := make(chan opened, 1)
 	go func() {
-		v, err := openVolume(c, &volumeTestMeta{}, &volumeTestStore{}, 4096, 0)
+		v, err := openVolume(c, &volumeTestMeta{}, &volumeTestStore{}, 4096, 0, 0)
 		done <- opened{v, err}
 	}()
 	r := receive(t, c.submitted)
@@ -253,7 +253,7 @@ func TestVolumeOpenRollback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newVolumeClient()
 			tc.configure(c)
-			v, err := openVolume(c, &volumeTestMeta{}, &volumeTestStore{}, 4096, 0)
+			v, err := openVolume(c, &volumeTestMeta{}, &volumeTestStore{}, 4096, 0, 0)
 			if v != nil || err != tc.want {
 				if v != nil {
 					_ = v.Close()
@@ -296,6 +296,8 @@ func TestVolumeOpenInvalidArguments(t *testing.T) {
 		{"negative block", valid, m, store, &chunk.Config{BlockSize: -1}},
 		{"negative readahead", valid, m, store,
 			&chunk.Config{BlockSize: 4096, Readahead: -1}},
+		{"negative retries", valid, m, store,
+			&chunk.Config{BlockSize: 4096, MaxRetries: -1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v, err := Open(tc.conf, tc.m, tc.store, tc.cc)

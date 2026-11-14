@@ -54,7 +54,7 @@ func ExampleOpen() {
 		}
 		// Always close, including when registration or reading fails. A read
 		// EIO followed by successful Close differs from Close itself returning
-		// EIO: the latter cannot establish that DMA has stopped.
+		// EIO: the latter cannot establish DMA completion and P2P revocation.
 		defer func() { closeErr = v.Close() }()
 
 		// Read at most 256 MiB, with room for any EOF alignment padding inside
@@ -103,9 +103,10 @@ func ExampleOpen() {
 	//   conf := xds.Config{Service: "xds-svc", Rank: 0, WorldSize: 1}
 	// Use the actual local rank and the same world size as other service clients.
 	// Handle both returned errors. If closeErr != nil, keep the allocation alive
-	// until the service exits or another mechanism proves DMA has stopped. A nil
-	// closeErr confirms xDS drainage; the application must still account for its
-	// own device work. Close the borrowed metadata/store only after this helper.
+	// until the service exits or another mechanism confirms DMA completion and
+	// P2P mapping revocation. A nil closeErr confirms both; the application must
+	// still account for its own device work. Close the borrowed metadata/store
+	// only after this helper.
 	_ = readModel
 
 	// No Output directive: compiled for API checking, not executed against a GPU.

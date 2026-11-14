@@ -84,6 +84,7 @@ type Volume struct {
 	// Immutable snapshots; the caller may reuse its configuration after Open.
 	blockSize     int
 	readahead     int
+	maxRetries    int
 	ioUnit        int
 	gpuBufferSize uint64
 
@@ -104,27 +105,28 @@ type Volume struct {
 //
 // Invalid arguments or geometry return EINVAL; unrepresentable layouts return
 // EOVERFLOW. Other native errors are returned unchanged. Valid arguments on an
-// unsupported build return ENOTSUP. The caller must not mutate cc during Open.
+// unsupported build return ENOTSUP. cc.MaxRetries is the additional source-read
+// retry budget; zero disables retries. The caller must not mutate cc during Open.
 func Open(conf Config, m meta.Meta, store chunk.ChunkStore, cc *chunk.Config) (*Volume, error) {
 	if conf.Service == "" || strings.IndexByte(conf.Service, 0) >= 0 ||
 		conf.WorldSize == 0 || conf.Rank >= conf.WorldSize ||
 		m == nil || store == nil || cc == nil ||
-		cc.BlockSize <= 0 || cc.Readahead < 0 {
+		cc.BlockSize <= 0 || cc.Readahead < 0 || cc.MaxRetries < 0 {
 		return nil, syscall.EINVAL
 	}
-	blockSize, readahead := cc.BlockSize, cc.Readahead
+	blockSize, readahead, maxRetries := cc.BlockSize, cc.Readahead, cc.MaxRetries
 	c, err := newClient(conf)
 	if err != nil {
 		return nil, err
 	}
-	return openVolume(c, m, store, blockSize, readahead)
+	return openVolume(c, m, store, blockSize, readahead, maxRetries)
 }
 
 // openVolume takes ownership of c on entry. On failure, it stops any started
 // engine before closing c; on success, ownership transfers to the Volume.
 // Keeping client construction outside permits isolated tests without mutable
 // global factories or changes to the native binding.
-func openVolume(c client, m meta.Meta, store chunk.ChunkStore, blockSize, readahead int) (*Volume, error) {
+func openVolume(c client, m meta.Meta, store chunk.ChunkStore, blockSize, readahead, maxRetries int) (*Volume, error) {
 	if c == nil {
 		return nil, syscall.EINVAL
 	}
@@ -143,7 +145,7 @@ func openVolume(c client, m meta.Meta, store chunk.ChunkStore, blockSize, readah
 		}
 		c.close()
 	}()
-	if m == nil || store == nil || blockSize <= 0 || readahead < 0 {
+	if m == nil || store == nil || blockSize <= 0 || readahead < 0 || maxRetries < 0 {
 		return nil, syscall.EINVAL
 	}
 
@@ -193,7 +195,7 @@ func openVolume(c client, m meta.Meta, store chunk.ChunkStore, blockSize, readah
 	bgCtx, cancel := context.WithCancel(context.Background())
 	v := &Volume{
 		c: c, e: e, tier: t, m: m, store: store,
-		blockSize: blockSize, readahead: readahead,
+		blockSize: blockSize, readahead: readahead, maxRetries: maxRetries,
 		ioUnit: int(cm.ioUnit), gpuBufferSize: cm.gpuBufferSize,
 		bgCtx: bgCtx, cancel: cancel,
 	}
@@ -210,20 +212,22 @@ func (v *Volume) IOUnit() int {
 	return v.ioUnit
 }
 
-// Close waits for admitted operations and background workers, then stops the
-// engine before closing its client. It is concurrent-safe and idempotent;
-// repeated calls return the original drain result.
+// Close waits for admitted operations and background workers, drains the engine,
+// and synchronously unregisters remaining device allocations before closing the
+// client. It is concurrent-safe and idempotent; repeated calls return the same
+// teardown result. A nil result confirms both DMA drain and device revocation.
 //
 // Registration calls hold the lifecycle read lock, so they also finish before
-// teardown. Do not wait for registration counters or unregister each record:
-// failures deliberately retain references, and client.close releases the session.
-// A control failure alone does not change Close's result; engine.stop determines
-// whether all submitted DMA was observed complete.
+// teardown. Retained registration counters may outlive failed requests; after a
+// confirmed drain they do not prevent direct native unregister. Do not call the
+// public Unregister here: it reacquires the lifecycle lock and rejects sticky
+// failure, even when a later engine drain has established completion.
 //
-// EIO means outstanding DMA could not be ruled out. Native client teardown is
-// not a device-memory synchronization barrier; in that case device memory must
-// remain alive until the service has exited or another mechanism proves DMA
-// has stopped. ioTimeout bounds engine draining, not the entire native close.
+// EIO means DMA drain or device revocation could not be confirmed. A previous
+// control failure, or any unregister error, makes further control RPCs unsafe;
+// Close still disconnects but does not treat that as a revocation acknowledgement.
+// Keep device memory alive until the service exits or another mechanism proves
+// it is safe. ioTimeout bounds engine draining, not the entire Close call.
 func (v *Volume) Close() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -242,7 +246,31 @@ func (v *Volume) Close() error {
 	if v.e != nil {
 		v.closeErr = v.e.stop()
 	}
+	if v.regs.failed.Load() {
+		// A failed registration may have reached the service without producing
+		// a usable local record. Even an empty table cannot prove revocation.
+		v.closeErr = syscall.EIO
+	}
 	if v.c != nil {
+		if v.closeErr == nil {
+			// The lifecycle write lock excludes all registry users. Native
+			// unregister waits for the service's buffer close and P2P revocation;
+			// closing the socket alone only schedules session cleanup. Remove
+			// each acknowledged record, keeping an uncertain tail on failure.
+			for len(v.regs.entries) != 0 {
+				reg := v.regs.entries[0]
+				if err := v.c.unregister(reg.ref); err != nil {
+					v.regs.failed.Store(true)
+					v.closeErr = syscall.EIO
+					break
+				}
+				v.regs.entries[0] = nil
+				v.regs.entries = v.regs.entries[1:]
+			}
+			if len(v.regs.entries) == 0 {
+				v.regs.entries = nil
+			}
+		}
 		v.c.close()
 		v.c = nil
 	}

@@ -36,6 +36,10 @@ n, err := v.ReadAt(ctx, file, devicePointer, size, offset)
 - A positive EOF short read returns `(n, nil)`; starting at or beyond EOF returns `(0, io.EOF)`. Holes read as zero. The bytes between `n` and its next I/O-unit boundary are zeroed; subsequent device bytes are untouched.
 - Other errors return `(0, errno)`. Some destination windows may already have changed; discard the result of that request. Metadata errno values are preserved, storage failures return `EIO`, and cancellation returns `EINTR`.
 
+Open snapshots `chunk.Config.MaxRetries` as the number of additional source-read retries. The CLI passes `io-retries` here (default 10); zero disables retries and negative values are rejected. Standalone Go callers should set this budget explicitly; VFS reads use `vfs.Config.Meta.Retries`, which is a separate field even though the CLI supplies both from the same option.
+
+After a source-read failure, ReadAt first waits for all workers and submitted DMA from that attempt, invalidates the metadata cache for every covered chunk, then replans and executes the entire valid range. This recovers transient object-storage errors and obsolete slice mappings after another client's compaction. Retry backoff matches VFS: 1 ms initially, 300 ms increments through retry 29, and 10 s from retry 30 onward. Waiting is cancellable. Metadata errors, DMA errors, and sticky device failures are not retried through this path. A successful retry may rewrite device bytes touched by an earlier attempt.
+
 Complete all device work touching the destination before calling ReadAt. Follow the xDS backend's visibility requirements; AMD callers must synchronize HIP both before and after the call.
 
 ## Planning and execution
@@ -52,4 +56,6 @@ Cancellation skips operations that have not started native submission. A concurr
 
 An engine or registration-control failure makes the device path unusable. ReadAt returns `EIO`, and affected registrations and DMA resources remain protected until teardown. Unregister returns `EBUSY` while a read owns the registration or the device path has failed.
 
-Close waits for foreground and background work, drains the engine, and closes the client. A nil result permits freeing device memory. If Close returns `EIO`, outstanding DMA could not be ruled out: retain device memory until the service has exited or another mechanism proves DMA has stopped. The engine drain timeout bounds draining, not the entire Close call. Reopen a Volume to establish a new session after failure.
+Close waits for foreground and background work, drains the engine, and synchronously unregisters each remaining device allocation before disconnecting the client. A nil result confirms both DMA completion and P2P mapping revocation, permitting device-memory release once the application's own device work has also finished. A previous registration-control failure or any unregister error makes Close return `EIO`, even when DMA has drained; no further unregister RPCs are issued on an uncertain control connection.
+
+If Close returns `EIO`, retain device memory until the service has exited or another mechanism confirms both DMA completion and P2P mapping revocation. Closing the socket only schedules asynchronous service cleanup and is not a revocation barrier. The engine drain timeout bounds draining, not the entire Close call. Repeated Close calls return the same result. Reopen a Volume to establish a new session after failure.

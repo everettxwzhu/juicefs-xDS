@@ -363,7 +363,7 @@ func (t *tier) fill(ctx context.Context, k blockKey, st *stager, sid int32) erro
 		if checkErr := t.check(ctx); checkErr != nil {
 			return checkErr
 		}
-		return syscall.EIO
+		return sourceReadError{}
 	}
 	// Chunk/cache workers may retain page references. Copy once into borrowed
 	// xDS memory; never let those workers observe a recyclable stager buffer.
