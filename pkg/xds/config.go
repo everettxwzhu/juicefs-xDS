@@ -26,9 +26,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
+)
+
+const (
+	maxPeers = 8
+	bdfLen   = 16
 )
 
 // Common errors returned by the xds package.
@@ -173,6 +179,14 @@ func (c *Config) Normalize() error {
 	if c.DeviceBackend > BackendAMD {
 		return fmt.Errorf("%w: unsupported xds device backend %d", ErrInvalidArg, uint32(c.DeviceBackend))
 	}
+	if len(c.PeerBDFs) > maxPeers {
+		return fmt.Errorf("%w: xds_peer_bdfs count %d exceeds max %d", ErrInvalidArg, len(c.PeerBDFs), maxPeers)
+	}
+	for _, bdf := range c.PeerBDFs {
+		if len(bdf) == 0 || len(bdf) >= bdfLen {
+			return fmt.Errorf("%w: invalid peer BDF %q (length must be in 1..%d)", ErrInvalidArg, bdf, bdfLen-1)
+		}
+	}
 	if c.BlockSize <= 0 {
 		c.BlockSize = 4 << 20 // 4 MiB, JuiceFS default
 	}
@@ -188,6 +202,11 @@ func (c *Config) Normalize() error {
 	}
 	if c.BlobCount == 0 {
 		return fmt.Errorf("%w: xds_blob_count must be > 0", ErrInvalidArg)
+	}
+	slotsPerBlob := c.BlobSize / uint64(c.BlockSize)
+	if slotsPerBlob == 0 || uint64(c.BlobCount) > uint64(math.MaxInt32)/slotsPerBlob {
+		return fmt.Errorf("%w: total cache slots overflow (%d blobs * %d slots/blob)",
+			ErrInvalidArg, c.BlobCount, slotsPerBlob)
 	}
 	if c.MaxInflight == 0 {
 		c.MaxInflight = 64

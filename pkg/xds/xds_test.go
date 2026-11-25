@@ -233,6 +233,22 @@ func TestConfigJSONAndNormalize(t *testing.T) {
 	require.ErrorIs(t, json.Unmarshal([]byte(`{"xds_device_backend":"unknown"}`), &bad), ErrInvalidArg)
 	bad = Config{BlobCount: 1, DeviceBackend: DeviceBackend(99)}
 	require.ErrorIs(t, bad.Normalize(), ErrInvalidArg)
+
+	// PeerBDFs count > maxPeers, empty/overlong BDFs, and TotalSlots overflow must fail.
+	tooManyPeers := make([]string, maxPeers+1)
+	for i := range tooManyPeers {
+		tooManyPeers[i] = fmt.Sprintf("0000:3b:%02x.0", i)
+	}
+	bad = Config{BlobCount: 1, PeerBDFs: tooManyPeers}
+	require.ErrorIs(t, bad.Normalize(), ErrInvalidArg)
+
+	bad = Config{BlobCount: 1, PeerBDFs: []string{""}}
+	require.ErrorIs(t, bad.Normalize(), ErrInvalidArg)
+	bad = Config{BlobCount: 1, PeerBDFs: []string{"0000:3b:00.01234"}} // 16 bytes -> no NUL room
+	require.ErrorIs(t, bad.Normalize(), ErrInvalidArg)
+
+	bad = Config{BlockSize: 4096, BlobSize: 4096 * 1024, BlobCount: ^uint32(0)}
+	require.ErrorIs(t, bad.Normalize(), ErrInvalidArg)
 }
 
 func TestBlockCachePinSafeEvictionCRCExpireAndWindowRead(t *testing.T) {
@@ -330,8 +346,35 @@ func TestBlockCachePinSafeEvictionCRCExpireAndWindowRead(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return !winEng.Cache().Exist("big")
 	}, time.Second, 10*time.Millisecond)
+
+	// Put must overwrite an expired entry directly without needing Pin first,
+	// and recycle the expired slot so slot count stays 1.
+	fresh := bytes.Repeat([]byte{0x7a}, 65536)
+	require.NoError(t, winEng.Cache().Put("big", fresh))
+	require.True(t, winEng.Cache().Exist("big"))
+	cnt, usedBytes = winEng.Cache().Stats()
+	require.Equal(t, int64(1), cnt)
+	require.Equal(t, int64(65536), usedBytes)
+	n, err = winEng.Cache().ReadAt("big", sub, 4100)
+	require.NoError(t, err)
+	require.Equal(t, 100, n)
+	require.Equal(t, fresh[4100:4200], sub)
+
+	// Wait for fresh entry to expire and verify Pin lazily deletes it.
+	require.Eventually(t, func() bool {
+		return !winEng.Cache().Exist("big")
+	}, time.Second, 10*time.Millisecond)
 	_, ok = winEng.Cache().Pin("big")
 	require.False(t, ok)
+
+	// Verify Engine.ImportBuffer consumes p2pFD even when Engine is closed.
+	require.NoError(t, winEng.Close())
+	evFD, err := unix.Eventfd(0, unix.EFD_CLOEXEC)
+	require.NoError(t, err)
+	_, _, err = winEng.ImportBuffer(evFD, 0x1000, 4096, nil)
+	require.ErrorIs(t, err, ErrClosed)
+	_, err = unix.FcntlInt(uintptr(evFD), unix.F_GETFD, 0)
+	require.ErrorIs(t, err, syscall.EBADF)
 }
 
 func TestBlockCacheConcurrentPinEvict(t *testing.T) {
@@ -704,6 +747,41 @@ func TestServerDirectReadOpsPipeliningAndValidation(t *testing.T) {
 	for i := range eng.Cache().slotPins {
 		require.Equal(t, uint32(0), eng.Cache().slotPins[i].Load())
 	}
+
+	// 7. Resolver extent gap, short coverage, and OrigLen overrun must fail with -EIO (no silent mis-offset).
+	resolver.setExtents(8192, []BlockExtent{{Key: "blk0", BlockOff: 0, Len: 4096, DstOff: 4096}})
+	c.sendReadDirect(bindRep.FileToken, 0, 8192, []wireSlice{{BufToken: bufTok, BufOffset: 0, Length: 8192}})
+	hdr, _, _ = c.recvReply()
+	require.Equal(t, -int32(syscall.EIO), hdr.Status)
+
+	resolver.setExtents(8192, []BlockExtent{{Key: "blk0", BlockOff: 0, Len: 4096, DstOff: 0}})
+	c.sendReadDirect(bindRep.FileToken, 0, 8192, []wireSlice{{BufToken: bufTok, BufOffset: 0, Length: 8192}})
+	hdr, _, _ = c.recvReply()
+	require.Equal(t, -int32(syscall.EIO), hdr.Status)
+
+	require.NoError(t, eng.Cache().Put("shortBlk", bytes.Repeat([]byte{'S'}, 4096)))
+	resolver.setExtents(8192, []BlockExtent{{Key: "shortBlk", BlockOff: 0, Len: 8192, DstOff: 0}})
+	c.sendReadDirect(bindRep.FileToken, 0, 8192, []wireSlice{{BufToken: bufTok, BufOffset: 0, Length: 8192}})
+	hdr, _, _ = c.recvReply()
+	require.Equal(t, -int32(syscall.EIO), hdr.Status)
+
+	for i := range eng.Cache().slotPins {
+		require.Equal(t, uint32(0), eng.Cache().slotPins[i].Load())
+	}
+
+	// 8. BIND_FILE with unexpected payload size returns -EMSGSIZE.
+	badBind := tokenMsg{
+		Hdr: msgHdr{
+			ABIVersion: protoABIVersion,
+			Type:       msgBindFile,
+			MsgSize:    uint32(unsafe.Sizeof(tokenMsg{})),
+			ReqID:      901,
+		},
+	}
+	_, _, err = c.conn.WriteMsgUnix(structBytes(&badBind), unix.UnixRights(int(f.Fd())), nil)
+	require.NoError(t, err)
+	hdr, _, _ = c.recvReply()
+	require.Equal(t, -int32(syscall.EMSGSIZE), hdr.Status)
 }
 
 func TestServerUnregisterDrainBackpressureAndCrashCleanup(t *testing.T) {

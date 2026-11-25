@@ -17,7 +17,9 @@
 package xds
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -101,8 +103,14 @@ func (e *Engine) Metrics() *Metrics {
 }
 
 // ImportBuffer forwards a client's exported P2P device buffer into xDS.
+// Always consumes p2pFD on both success and error.
 func (e *Engine) ImportBuffer(p2pFD int, deviceVA, size uint64, peers []PeerExport) (RegHandle, uintptr, error) {
 	if e.closed.Load() {
+		if p2pFD >= 0 {
+			if f := os.NewFile(uintptr(p2pFD), ""); f != nil {
+				_ = f.Close()
+			}
+		}
 		return 0, 0, ErrClosed
 	}
 	reg, ioPtr, err := e.rt.ImportBuffer(p2pFD, deviceVA, size, peers)
@@ -139,8 +147,5 @@ func (e *Engine) Close() error {
 	e.cache.close()
 	err1 := e.rt.ReleaseBlobs(e.blobs)
 	err2 := e.rt.Stop()
-	if err1 != nil {
-		return err1
-	}
-	return err2
+	return errors.Join(err1, err2)
 }

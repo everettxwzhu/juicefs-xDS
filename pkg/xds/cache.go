@@ -249,11 +249,16 @@ func (c *BlockCache) Put(key string, data []byte) error {
 
 	sh := c.shardFor(key)
 	sh.mu.Lock()
-	if _, exists := sh.lru.Peek(key); exists {
-		// Another goroutine won the race; discard our duplicate slot cleanly.
-		sh.mu.Unlock()
-		c.freeSlotDirect(slotIdx)
-		return nil
+	var expiredOld *cacheEntry
+	if old, exists := sh.lru.Peek(key); exists {
+		if old.expireAt == 0 || time.Now().UnixNano() <= old.expireAt {
+			// Another goroutine won the race with a live entry; discard duplicate slot.
+			sh.mu.Unlock()
+			c.freeSlotDirect(slotIdx)
+			return nil
+		}
+		expiredOld = old
+		sh.lru.Remove(key)
 	}
 	sh.lru.Add(key, &cacheEntry{
 		slotIdx:  slotIdx,
@@ -263,6 +268,10 @@ func (c *BlockCache) Put(key string, data []byte) error {
 	})
 	sh.mu.Unlock()
 
+	if expiredOld != nil {
+		c.recordRemove(expiredOld.origLen, false)
+		c.recycleSlot(expiredOld.slotIdx)
+	}
 	c.usedSlots.Add(1)
 	c.usedBytes.Add(int64(len(data)))
 	c.metrics.CacheSlotsUsed.Inc()

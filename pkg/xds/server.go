@@ -24,7 +24,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	slices0 "slices"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -36,12 +36,14 @@ import (
 
 // Wire protocol constants and binary structures mirroring proto.h.
 const (
-	protoABIVersion = 1
-	maxPeers        = 8
-	bdfLen          = 16
-	maxSlices       = 64
-	maxHoles        = 32
+	protoABIVersion    = 1
+	maxSlices          = 64
+	maxHoles           = 32
+	maxFilesPerSession = 4096
+	maxBufsPerSession  = 1024
+)
 
+const (
 	msgHello = iota + 1
 	msgHelloReply
 	msgBindFile
@@ -340,6 +342,11 @@ func (s *Server) handleConn(conn *net.UnixConn) {
 			sess.handleHello(hdr.ReqID)
 
 		case msgBindFile:
+			if n != int(unsafe.Sizeof(msgHdr{})) {
+				closeFDs(fds)
+				sess.sendStatus(hdr.ReqID, -int32(syscall.EMSGSIZE))
+				continue
+			}
 			sess.handleBindFile(hdr.ReqID, fds)
 
 		case msgUnbindFile:
@@ -440,6 +447,10 @@ func (sess *clientSession) handleBindFile(reqID uint64, fds []int) {
 		sess.sendStatus(reqID, -int32(syscall.EINVAL))
 		return
 	}
+	if len(sess.files) >= maxFilesPerSession {
+		sess.sendStatus(reqID, -int32(syscall.ENOSPC))
+		return
+	}
 
 	tok := sess.nextToken
 	sess.nextToken++
@@ -467,9 +478,14 @@ func (sess *clientSession) handleRegisterBuf(msg *registerBufMsg, fds []int) {
 	}
 	p2pFD := fds[0]
 	cfgPeers := sess.server.cfg.PeerBDFs
-	if int(msg.PeerCount) != len(cfgPeers) || msg.SizeBytes == 0 {
+	if msg.PeerCount == 0 || msg.PeerCount > maxPeers || int(msg.PeerCount) != len(cfgPeers) || msg.SizeBytes == 0 {
 		_ = unix.Close(p2pFD)
 		sess.sendStatus(msg.Hdr.ReqID, -int32(syscall.EINVAL))
+		return
+	}
+	if len(sess.bufs) >= maxBufsPerSession {
+		_ = unix.Close(p2pFD)
+		sess.sendStatus(msg.Hdr.ReqID, -int32(syscall.ENOSPC))
 		return
 	}
 
@@ -573,15 +589,14 @@ func (sess *clientSession) handleReadDirect(raw []byte) {
 	}
 
 	wireSlices := unsafe.Slice((*wireSlice)(unsafe.Pointer(&raw[hdrSize])), req.SliceCount)
-	slices := make([]wireSlice, req.SliceCount)
-	copy(slices, wireSlices)
+	dstSlices := slices.Clone(wireSlices)
 
 	// Validate slices and collect referenced buffers synchronously before
 	// advancing the socket reader, preserving ordering with UNREGISTER_BUF.
 	var sum uint64
-	bufMap := make([]*importedBuf, len(slices))
+	bufMap := make([]*importedBuf, len(dstSlices))
 	pinnedBufs := make([]*importedBuf, 0, 4)
-	for i, sl := range slices {
+	for i, sl := range dstSlices {
 		if sl.Length == 0 || sum+sl.Length < sum {
 			fail(syscall.EINVAL)
 			return
@@ -597,7 +612,7 @@ func (sess *clientSession) handleReadDirect(raw []byte) {
 			return
 		}
 		bufMap[i] = b
-		if !slices0.Contains(pinnedBufs, b) {
+		if !slices.Contains(pinnedBufs, b) {
 			pinnedBufs = append(pinnedBufs, b)
 		}
 	}
@@ -625,7 +640,7 @@ func (sess *clientSession) handleReadDirect(raw []byte) {
 			<-sess.inflightSem
 			sess.ioWG.Done()
 		}()
-		sess.execReadDirect(req.Hdr.ReqID, ino, req.FileOffset, req.Length, slices, bufMap, start)
+		sess.execReadDirect(req.Hdr.ReqID, ino, req.FileOffset, req.Length, dstSlices, bufMap, start)
 	}()
 }
 
@@ -637,7 +652,7 @@ type directPlan struct {
 
 func (sess *clientSession) planDirectExtents(
 	extents []BlockExtent, totalBytes uint64,
-	slices []wireSlice, bufMap []*importedBuf,
+	dstSlices []wireSlice, bufMap []*importedBuf,
 ) (directPlan, syscall.Errno) {
 	unit := sess.server.engine.Info().IOUnitSize
 	blockSize := uint64(sess.server.cfg.BlockSize)
@@ -654,22 +669,30 @@ func (sess *clientSession) planDirectExtents(
 
 	si := 0
 	var sConsumed uint64
+	var cursor uint64
 
 	for _, ext := range extents {
 		if ext.DstOff >= totalBytes {
 			break
 		}
+		if ext.DstOff != cursor {
+			unpinAll()
+			return directPlan{}, syscall.EIO
+		}
 		extLen := uint64(ext.Len)
+		if extLen == 0 {
+			continue
+		}
 		if ext.DstOff+extLen > totalBytes {
 			extLen = totalBytes - ext.DstOff
 		}
 
 		if ext.IsHole {
 			rem := extLen
-			for rem > 0 && si < len(slices) {
-				sAvail := slices[si].Length - sConsumed
+			for rem > 0 && si < len(dstSlices) {
+				sAvail := dstSlices[si].Length - sConsumed
 				take := min(rem, sAvail)
-				dstOff := slices[si].BufOffset + sConsumed
+				dstOff := dstSlices[si].BufOffset + sConsumed
 				if n := len(plan.holes); n > 0 &&
 					plan.holes[n-1].SliceIndex == uint32(si) &&
 					plan.holes[n-1].DstOffset+plan.holes[n-1].Length == dstOff {
@@ -687,11 +710,16 @@ func (sess *clientSession) planDirectExtents(
 				}
 				rem -= take
 				sConsumed += take
-				if sConsumed == slices[si].Length {
+				if sConsumed == dstSlices[si].Length {
 					si++
 					sConsumed = 0
 				}
 			}
+			if rem != 0 {
+				unpinAll()
+				return directPlan{}, syscall.EINVAL
+			}
+			cursor += extLen
 			continue
 		}
 
@@ -706,13 +734,17 @@ func (sess *clientSession) planDirectExtents(
 			return directPlan{}, syscall.EAGAIN
 		}
 		plan.pinnedSlots = append(plan.pinnedSlots, slot.SlotIndex)
+		if uint64(ext.BlockOff)+extLen > uint64(slot.OrigLen) {
+			unpinAll()
+			return directPlan{}, syscall.EIO
+		}
 
 		var iovs []IOVec
 		rem := extLen
-		for rem > 0 && si < len(slices) {
-			sAvail := slices[si].Length - sConsumed
+		for rem > 0 && si < len(dstSlices) {
+			sAvail := dstSlices[si].Length - sConsumed
 			take := min(rem, sAvail)
-			addr := bufMap[si].ioPtr + uintptr(slices[si].BufOffset+sConsumed)
+			addr := bufMap[si].ioPtr + uintptr(dstSlices[si].BufOffset+sConsumed)
 			if n := len(iovs); n > 0 && iovs[n-1].Base+uintptr(iovs[n-1].Len) == addr {
 				iovs[n-1].Len += take
 			} else {
@@ -720,7 +752,7 @@ func (sess *clientSession) planDirectExtents(
 			}
 			rem -= take
 			sConsumed += take
-			if sConsumed == slices[si].Length {
+			if sConsumed == dstSlices[si].Length {
 				si++
 				sConsumed = 0
 			}
@@ -741,14 +773,19 @@ func (sess *clientSession) planDirectExtents(
 			d.Iovs = iovs
 		}
 		plan.descs = append(plan.descs, d)
+		cursor += extLen
 	}
 
+	if cursor != totalBytes {
+		unpinAll()
+		return directPlan{}, syscall.EIO
+	}
 	return plan, 0
 }
 
 func (sess *clientSession) execReadDirect(
 	reqID, ino, fileOff, reqLen uint64,
-	slices []wireSlice, bufMap []*importedBuf, start time.Time,
+	dstSlices []wireSlice, bufMap []*importedBuf, start time.Time,
 ) {
 	metrics := sess.server.engine.Metrics()
 	fail := func(code syscall.Errno) {
@@ -771,7 +808,7 @@ func (sess *clientSession) execReadDirect(
 		return
 	}
 
-	plan, code := sess.planDirectExtents(extents, totalBytes, slices, bufMap)
+	plan, code := sess.planDirectExtents(extents, totalBytes, dstSlices, bufMap)
 	if code != 0 {
 		fail(code)
 		return

@@ -21,7 +21,7 @@ pkg/xds/
 ├── proto.h          # 外部 C/C++ 客户端跨进程 Unix SOCK_SEQPACKET 协议头文件（含 C11 _Static_assert）
 ├── config.go        # Config / DeviceBackend(JSON) / EndpointInfo / 错误定义与参数规范化
 ├── runtime.go       # Runtime 抽象接口与与 CGo 解耦的数据类型（支持纯内存 fakeRuntime 单测）
-├── runtime_cgo.go   # Linux + -tags xds 的 CGo 实现：直接调用 xDS C API + 内联极薄异步转同步 shim
+├── runtime_cgo.go   # Linux + -tags xds 的 CGo 实现：直调 xDS C API + 进程内无锁全局 CQ & eventfd netpoller
 ├── runtime_stub.go  # 默认/非 Linux 编译期占位 Stub（返回 ErrUnsupported）
 ├── metrics.go       # Prometheus 指标定义与注册
 ├── engine.go        # Engine：托管 Runtime 生命周期、Blob 租约、BlockCache 与 P2P DMA 入口
@@ -40,7 +40,7 @@ pkg/xds/
 #### 2.2 统一 `SOCK_SEQPACKET` 流水线 + Go 原生并发模型（`server.go` / `runtime_cgo.go`）
 - **控制面与数据面合一**：所有消息复用同一条 Unix `SOCK_SEQPACKET` 连接（天然保序、保留消息边界、支持 `SCM_RIGHTS` 传 fd 与 `SO_PEERCRED` 鉴权）。客户端可通过 `req_id` 并发流水线发送最多 `MaxInflight`（默认 64）条 `MSG_READ_DIRECT` 请求。
 - **标量/散射读合一**：`JFS_XDS_MSG_READ_DIRECT` 头部 56 字节后紧跟 `slice_count`（1~64）个 24 字节 `slice`，1-slice 标量读仅 80 字节；回包 `JFS_XDS_MSG_READ_DIRECT_REPLY` 头部 40 字节后紧跟 `hole_count`（0~32）个 24 字节稀疏空洞，0 空洞回包仅 40 字节且零堆分配。
-- **零独立 C 源文件、零堆分配 C 热路径**：`runtime_cgo.go` 直接 `#include "xds/*.h"` 调用 `xds_runtime_*`、`xds_blob_pool_*` 与 `xds_direct_unregister_buffer`，仅内联极薄的 `static` C 辅助函数将异步 SPDK 回调转为 `sem_t` 阻塞等待（`<= 32` desc 且 `<= 64` iov 直接使用栈数组，回调中仅执行 `w->status = status; sem_post(&w->sem)`）；Go 侧通过 `defer cache.Unpin(idx)` 与 `sync.WaitGroup` 完成槽位释放与排空。
+- **全异步无锁 CQ + 零 OS 线程阻塞**：`runtime_cgo.go` 直接 `#include "xds/*.h"` 调用同步控制 API，并在内部维护 1 个进程私有的 4096 槽无锁 MPSC 完成队列（CQ）与 1 个接入 Go `epoll` netpoller 的 `eventfd`。提交 I/O 立即返回，业务 goroutine 挂在 Go `chan error`（零 OS 线程占用）；SPDK reactor 回调仅执行 wait-free 入队与 `armed` 合并唤醒（高负载零 syscall），单分发 goroutine 每次 CGo 批量 drain 最多 64 条完成事件；常规批量（`<= 32` desc、`<= 64` iov）热路径零堆分配。
 - **单 goroutine 所有权**：每个连接的 `files` / `bufs` 映射仅由 `handleConn` 单读循环访问（无需会话表锁）；`writeMu` 串行化回包写入；任何写错误立即 `sess.cancel()` 唤醒阻塞读/背压路径。
 
 ---
@@ -104,7 +104,7 @@ sequenceDiagram
     W->>R: ResolveRead(sess.ctx, ino, off, len)
     R-->>W: []BlockExtent, fileSize (未命中块已 Put 进 BlockCache)
     W->>B: Pin(ext.Key) + 双指针切分 IOV / 合并稀疏空洞
-    W->>E: ReadDirectBatch(descs) -> xds_submit_read_batch + sem_wait
+    W->>E: ReadDirectBatch(descs) -> xds_submit_read_batch + <-slotCh (无锁 CQ 异步回调)
     E-->>W: NVMe→显存 P2P DMA 完成
     W->>B: defer Unpin(pinnedSlots)
     W-->>C: MSG_READ_DIRECT_REPLY (req_id, bytes_read, holes[0..32])
