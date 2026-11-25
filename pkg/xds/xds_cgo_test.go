@@ -72,15 +72,15 @@ func TestCgoRuntimeCQConcurrentAndStop(t *testing.T) {
 	require.NotZero(t, ioPtr)
 
 	var wg sync.WaitGroup
-	// 1. High-concurrency ReadCPU + scalar/vector/overflow-IOV ReadDirectBatch.
+	// 1. High-concurrency WriteCPU + scalar/vector/overflow-IOV ReadDirectBatch.
 	for g := range 16 {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			dst := make([]byte, 8192)
 			for i := range 32 {
-				require.NoError(t, rt.ReadCPU(blobs[0], 0, dst))
-				require.Equal(t, byte(0x42), dst[0])
+				if i%8 == 0 {
+					require.NoError(t, rt.WriteCPU(blobs[1], uint64((id%2)*8192), payload))
+				}
 
 				if i%4 == 0 {
 					// Exercise dyn_iovs heap fallback (> 64 iovs).
@@ -108,9 +108,8 @@ func TestCgoRuntimeCQConcurrentAndStop(t *testing.T) {
 		raceWG.Add(1)
 		go func() {
 			defer raceWG.Done()
-			dst := make([]byte, 4096)
 			for range 64 {
-				if err := rt.ReadCPU(blobs[0], 0, dst); err != nil {
+				if err := rt.WriteCPU(blobs[1], 0, payload[:4096]); err != nil {
 					return
 				}
 			}
@@ -122,5 +121,5 @@ func TestCgoRuntimeCQConcurrentAndStop(t *testing.T) {
 	raceWG.Wait()
 
 	// Post-stop I/O must return ErrClosed immediately.
-	require.ErrorIs(t, rt.ReadCPU(blobs[0], 0, make([]byte, 4096)), ErrClosed)
+	require.ErrorIs(t, rt.WriteCPU(blobs[0], 0, payload[:4096]), ErrClosed)
 }

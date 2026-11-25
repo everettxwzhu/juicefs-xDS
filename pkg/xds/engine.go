@@ -65,7 +65,7 @@ func NewEngine(cfg *Config, rt Runtime, reg prometheus.Registerer) (*Engine, err
 	}
 
 	metrics := newMetrics(reg)
-	cache, err := newBlockCache(rt, blobs, *cfg, info.IOUnitSize, metrics)
+	cache, err := newBlockCache(rt, blobs, *cfg, metrics)
 	if err != nil {
 		_ = rt.ReleaseBlobs(blobs)
 		_ = rt.Stop()

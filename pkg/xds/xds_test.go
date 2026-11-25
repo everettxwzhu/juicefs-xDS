@@ -46,16 +46,15 @@ type fakeImportedBuf struct {
 // fakeRuntime simulates SPDK blobs, imported DMA aliases, and P2P batch reads
 // completely in memory.
 type fakeRuntime struct {
-	mu             sync.Mutex
-	ioUnit         uint64
-	blobSize       uint64
-	blobs          map[BlobHandle][]byte
-	imported       map[RegHandle]*fakeImportedBuf
-	nextReg        RegHandle
-	activeImport   atomic.Int32
-	lastReadCPULen atomic.Int64
-	blockGate      chan struct{} // optional gate to hold DMA in flight
-	submitNotify   chan struct{} // optional signal when ReadDirectBatch enters
+	mu           sync.Mutex
+	ioUnit       uint64
+	blobSize     uint64
+	blobs        map[BlobHandle][]byte
+	imported     map[RegHandle]*fakeImportedBuf
+	nextReg      RegHandle
+	activeImport atomic.Int32
+	blockGate    chan struct{} // optional gate to hold DMA in flight
+	submitNotify chan struct{} // optional signal when ReadDirectBatch enters
 }
 
 func newFakeRuntime(ioUnit uint64) *fakeRuntime {
@@ -131,15 +130,6 @@ func (f *fakeRuntime) copyToAliasLocked(addr uintptr, src []byte) {
 		}
 	}
 	panic(fmt.Sprintf("fakeRuntime: invalid alias address 0x%x len=%d", addr, len(src)))
-}
-
-func (f *fakeRuntime) ReadCPU(blob BlobHandle, blobOff uint64, dst []byte) error {
-	f.lastReadCPULen.Store(int64(len(dst)))
-	f.mu.Lock()
-	data := f.blobs[blob]
-	f.mu.Unlock()
-	copy(dst, data[blobOff:blobOff+uint64(len(dst))])
-	return nil
 }
 
 func (f *fakeRuntime) WriteCPU(blob BlobHandle, blobOff uint64, src []byte) error {
@@ -251,12 +241,11 @@ func TestConfigJSONAndNormalize(t *testing.T) {
 	require.ErrorIs(t, bad.Normalize(), ErrInvalidArg)
 }
 
-func TestBlockCachePinSafeEvictionCRCExpireAndWindowRead(t *testing.T) {
+func TestBlockCachePinSafeEvictionAndExpiry(t *testing.T) {
 	cfg := &Config{
-		BlockSize:      8192,
-		BlobSize:       16384, // 2 slots per blob
-		BlobCount:      2,     // 4 total slots
-		VerifyChecksum: true,
+		BlockSize: 8192,
+		BlobSize:  16384, // 2 slots per blob
+		BlobCount: 2,     // 4 total slots
 	}
 	rt := newFakeRuntime(4096)
 	eng, err := NewEngine(cfg, rt, prometheus.NewRegistry())
@@ -301,77 +290,64 @@ func TestBlockCachePinSafeEvictionCRCExpireAndWindowRead(t *testing.T) {
 	cache.Unpin(p3.SlotIndex)
 	cache.Unpin(p4.SlotIndex)
 
-	// Verify ReadAt + CRC32C check and corruption eviction.
-	got := make([]byte, 8192)
-	n, err := cache.ReadAt("k4", got, 0)
-	require.NoError(t, err)
-	require.Equal(t, 8192, n)
-	require.Equal(t, bytes.Repeat([]byte{'e'}, 8192), got)
-
 	cnt, usedBytes := cache.Stats()
 	require.Equal(t, int64(4), cnt)
 	require.Equal(t, int64(4*8192), usedBytes)
 
+	// Verify pinned slot contains the exact bytes written to NVMe blob.
 	rt.mu.Lock()
-	rt.blobs[p4.Blob][p4.BlobOffset] ^= 0xff
+	require.Equal(t, bytes.Repeat([]byte{'e'}, 8192), rt.blobs[p4.Blob][p4.BlobOffset:p4.BlobOffset+8192])
 	rt.mu.Unlock()
-	_, err = cache.ReadAt("k4", got, 0)
-	require.ErrorIs(t, err, ErrCorrupt)
-	require.False(t, cache.Exist("k4"))
 
-	// Unaligned non-CRC ReadAt reads only the minimal IOUnit window.
-	winRT := newFakeRuntime(4096)
-	winEng, err := NewEngine(&Config{
+	// Expiry + overwrite-expired-slot + Engine.ImportBuffer fd cleanup on closed Engine.
+	expRT := newFakeRuntime(4096)
+	expEng, err := NewEngine(&Config{
 		BlockSize:   65536,
 		BlobSize:    65536,
 		BlobCount:   1,
 		CacheExpire: 40 * time.Millisecond,
-	}, winRT, prometheus.NewRegistry())
+	}, expRT, prometheus.NewRegistry())
 	require.NoError(t, err)
-	defer func() { require.NoError(t, winEng.Close()) }()
+	defer func() { require.NoError(t, expEng.Close()) }()
 
 	block := make([]byte, 65536)
 	for i := range block {
 		block[i] = byte(i % 251)
 	}
-	require.NoError(t, winEng.Cache().Put("big", block))
-
-	sub := make([]byte, 100)
-	n, err = winEng.Cache().ReadAt("big", sub, 4100)
-	require.NoError(t, err)
-	require.Equal(t, 100, n)
-	require.Equal(t, block[4100:4200], sub)
-	require.Equal(t, int64(4096), winRT.lastReadCPULen.Load())
+	require.NoError(t, expEng.Cache().Put("big", block))
+	require.True(t, expEng.Cache().Exist("big"))
 
 	require.Eventually(t, func() bool {
-		return !winEng.Cache().Exist("big")
+		return !expEng.Cache().Exist("big")
 	}, time.Second, 10*time.Millisecond)
 
 	// Put must overwrite an expired entry directly without needing Pin first,
 	// and recycle the expired slot so slot count stays 1.
 	fresh := bytes.Repeat([]byte{0x7a}, 65536)
-	require.NoError(t, winEng.Cache().Put("big", fresh))
-	require.True(t, winEng.Cache().Exist("big"))
-	cnt, usedBytes = winEng.Cache().Stats()
+	require.NoError(t, expEng.Cache().Put("big", fresh))
+	require.True(t, expEng.Cache().Exist("big"))
+	cnt, usedBytes = expEng.Cache().Stats()
 	require.Equal(t, int64(1), cnt)
 	require.Equal(t, int64(65536), usedBytes)
-	n, err = winEng.Cache().ReadAt("big", sub, 4100)
-	require.NoError(t, err)
-	require.Equal(t, 100, n)
-	require.Equal(t, fresh[4100:4200], sub)
+	ps, ok := expEng.Cache().Pin("big")
+	require.True(t, ok)
+	expRT.mu.Lock()
+	require.Equal(t, fresh, expRT.blobs[ps.Blob][ps.BlobOffset:ps.BlobOffset+65536])
+	expRT.mu.Unlock()
+	expEng.Cache().Unpin(ps.SlotIndex)
 
 	// Wait for fresh entry to expire and verify Pin lazily deletes it.
 	require.Eventually(t, func() bool {
-		return !winEng.Cache().Exist("big")
+		return !expEng.Cache().Exist("big")
 	}, time.Second, 10*time.Millisecond)
-	_, ok = winEng.Cache().Pin("big")
+	_, ok = expEng.Cache().Pin("big")
 	require.False(t, ok)
 
 	// Verify Engine.ImportBuffer consumes p2pFD even when Engine is closed.
-	require.NoError(t, winEng.Close())
+	require.NoError(t, expEng.Close())
 	evFD, err := unix.Eventfd(0, unix.EFD_CLOEXEC)
 	require.NoError(t, err)
-	_, _, err = winEng.ImportBuffer(evFD, 0x1000, 4096, nil)
+	_, _, err = expEng.ImportBuffer(evFD, 0x1000, 4096, nil)
 	require.ErrorIs(t, err, ErrClosed)
 	_, err = unix.FcntlInt(uintptr(evFD), unix.F_GETFD, 0)
 	require.ErrorIs(t, err, syscall.EBADF)
@@ -379,12 +355,12 @@ func TestBlockCachePinSafeEvictionCRCExpireAndWindowRead(t *testing.T) {
 
 func TestBlockCacheConcurrentPinEvict(t *testing.T) {
 	cfg := &Config{
-		BlockSize:      4096,
-		BlobSize:       16384,
-		BlobCount:      4,
-		VerifyChecksum: true,
+		BlockSize: 4096,
+		BlobSize:  16384,
+		BlobCount: 4,
 	}
-	eng, err := NewEngine(cfg, newFakeRuntime(4096), prometheus.NewRegistry())
+	rt := newFakeRuntime(4096)
+	eng, err := NewEngine(cfg, rt, prometheus.NewRegistry())
 	require.NoError(t, err)
 	defer func() { require.NoError(t, eng.Close()) }()
 
@@ -394,13 +370,13 @@ func TestBlockCacheConcurrentPinEvict(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			buf := make([]byte, 4096)
 			for i := range 64 {
 				key := fmt.Sprintf("blk-%d", (id*7+i)%32)
 				payload := bytes.Repeat([]byte{byte((id*7 + i) % 32)}, 4096)
 				_ = cache.Put(key, payload)
-				if _, err := cache.ReadAt(key, buf, 0); err == nil {
-					require.Equal(t, payload[0], buf[0])
+				if slot, ok := cache.Pin(key); ok {
+					require.Equal(t, uint32(4096), slot.OrigLen)
+					cache.Unpin(slot.SlotIndex)
 				}
 			}
 		}(g)
@@ -633,16 +609,27 @@ func TestServerDirectReadOpsPipeliningAndValidation(t *testing.T) {
 	go func() { _ = srv.Serve() }()
 	defer func() { require.NoError(t, srv.Close()) }()
 
+	// A second NewServer on the same active socket path must fail with ErrBusy
+	// instead of unlinking the live server's socket.
+	_, err = NewServer(eng, resolver)
+	require.ErrorIs(t, err, ErrBusy)
+
 	c, helloRep := dialTestClient(t, sockPath)
 	defer c.close()
 	require.Equal(t, uint32(64), helloRep.MaxInflight)
 	require.Equal(t, uint64(4096), helloRep.IOUnitSize)
 
-	// BIND_FILE rejects write-only fd (-EACCES) and cross-device fd (-EXDEV).
+	// BIND_FILE rejects write-only fd (-EACCES), O_PATH fd (-EACCES), and cross-device fd (-EXDEV).
 	woFile, err := os.OpenFile(samplePath, os.O_WRONLY, 0)
 	require.NoError(t, err)
 	_, st := c.bindFile(int(woFile.Fd()))
 	_ = woFile.Close()
+	require.Equal(t, -int32(syscall.EACCES), st)
+
+	pathFD, err := unix.Open(samplePath, unix.O_PATH|unix.O_CLOEXEC, 0)
+	require.NoError(t, err)
+	_, st = c.bindFile(pathFD)
+	_ = unix.Close(pathFD)
 	require.Equal(t, -int32(syscall.EACCES), st)
 
 	devNull, err := os.Open("/dev/null")

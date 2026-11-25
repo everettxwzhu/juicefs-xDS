@@ -46,6 +46,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/juicedata/juicefs/pkg/xds"
 )
 
 func cmdMount() *cli.Command {
@@ -239,6 +240,17 @@ func cacheDirPathToAbs(c *cli.Context) {
 			for i, a := range os.Args {
 				if a == rpAcLog || a == "--access-log="+rpAcLog {
 					os.Args[i] = a[:len(a)-len(rpAcLog)] + ap
+					break
+				}
+			}
+		}
+	}
+
+	if xdsCfg := c.String("xds-config"); xdsCfg != "" {
+		if ap, err := filepath.Abs(xdsCfg); err == nil && ap != xdsCfg {
+			for i, a := range os.Args {
+				if a == xdsCfg || a == "--xds-config="+xdsCfg {
+					os.Args[i] = a[:len(a)-len(xdsCfg)] + ap
 					break
 				}
 			}
@@ -614,6 +626,17 @@ func mount(c *cli.Context) error {
 	chunkConf := getChunkConf(c, format)
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	setFuseOption(c, format, vfsConf)
+	var xdsConf *xds.Config
+	if stage != 1 {
+		xdsConf, err = loadXDSConfig(c, chunkConf, vfsConf.FuseOpts.AllowOther)
+		if err != nil {
+			return err
+		}
+		if xdsConf != nil {
+			// Mark XDS active in vfsConf so stage 0/2 can disable graceful upgrade.
+			vfsConf.XDS = &xds.EndpointInfo{SocketPath: xdsConf.SocketPath}
+		}
+	}
 	if stage == 0 || stage == 3 {
 		blob, err = NewReloadableStorage(format, metaCli, updateFormat(c))
 		if err != nil {
@@ -689,13 +712,22 @@ func mount(c *cli.Context) error {
 		return nil
 	})
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
+	xdsRT, err := startXDS(xdsConf, v, registerer)
+	if err != nil {
+		_ = metaCli.CloseSession()
+		object.Shutdown(blob)
+		return err
+	}
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
 	mountMain(v, c)
+	// Drain cross-process P2P DMA before flushing writes and stopping SPDK.
+	xdsRT.stopServer()
 	if err := v.FlushAll(""); err != nil {
 		logger.Errorf("flush all delayed data: %s", err)
 	}
+	xdsRT.closeEngine()
 	err = metaCli.CloseSession()
 	object.Shutdown(blob)
 	logger.Infof("The juicefs mount process exit successfully, mountpoint: %q", metaConf.MountPoint)

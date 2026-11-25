@@ -71,11 +71,17 @@ func (s *rSlice) blockSize(indx int) int {
 	return bsize
 }
 
-func (s *rSlice) key(indx int) string {
-	if s.store.conf.HashPrefix {
-		return fmt.Sprintf("chunks/%02X/%v/%v_%v_%v", s.id%256, s.id/1000/1000, s.id, indx, s.blockSize(indx))
+// BlockKey formats the canonical JuiceFS object/cache key for block indx of
+// slice id with original plaintext length size.
+func BlockKey(hashPrefix bool, id uint64, indx, size int) string {
+	if hashPrefix {
+		return fmt.Sprintf("chunks/%02X/%v/%v_%v_%v", id%256, id/1000/1000, id, indx, size)
 	}
-	return fmt.Sprintf("chunks/%v/%v/%v_%v_%v", s.id/1000/1000, s.id/1000, s.id, indx, s.blockSize(indx))
+	return fmt.Sprintf("chunks/%v/%v/%v_%v_%v", id/1000/1000, id/1000, id, indx, size)
+}
+
+func (s *rSlice) key(indx int) string {
+	return BlockKey(s.store.conf.HashPrefix, s.id, indx, s.blockSize(indx))
 }
 
 func (s *rSlice) index(off int) int {
@@ -1291,8 +1297,69 @@ func (store *cachedStore) UpdateLimit(upload, download int64) {
 	}
 }
 
+// LoadBlock returns a full plaintext block of length size in a ref-counted
+// off-heap Page. If the block is already present in the local POSIX cache or
+// writeback staging area, it is read locally; otherwise it is fetched via the
+// shared singleflight controller from object storage (with bounded retries on
+// transient errors) without inserting into the POSIX cache. Callers must call
+// page.Release() when done.
+func (store *cachedStore) LoadBlock(ctx context.Context, key string, size int) (*Page, error) {
+	if size <= 0 || size > store.conf.BlockSize {
+		return nil, fmt.Errorf("invalid block size %d for %s", size, key)
+	}
+	if store.conf.CacheEnabled() {
+		if r, err := store.bcache.load(key); err == nil {
+			p := NewOffPage(size)
+			n, rerr := r.ReadAt(p.Data, 0)
+			if !store.conf.OSCache {
+				dropOSCache(r)
+			}
+			_ = r.Close()
+			if rerr == nil && n == size {
+				return p, nil
+			}
+			p.Release()
+		}
+	}
+
+	maxTries := max(store.conf.MaxRetries+1, 1)
+	var lastErr error
+	for try := 0; try < maxTries; try++ {
+		if try > 0 {
+			backoff := min(time.Millisecond*100*time.Duration(1<<(try-1)), time.Second*2)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		}
+		block, err := store.group.Execute(key, func() (*Page, error) {
+			tmp := NewOffPage(size)
+			return tmp, store.load(ctx, key, tmp, false, false)
+		})
+		if err == nil {
+			if len(block.Data) != size {
+				block.Release()
+				return nil, fmt.Errorf("block %s length mismatch: got %d, want %d", key, len(block.Data), size)
+			}
+			return block, nil
+		}
+		block.Release()
+		lastErr = err
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || os.IsNotExist(err) {
+			break
+		}
+	}
+	return nil, lastErr
+}
+
 func (store *cachedStore) BlobStorage() object.ObjectStorage {
 	return store.storage
 }
 
-var _ ChunkStore = (*cachedStore)(nil)
+var (
+	_ ChunkStore  = (*cachedStore)(nil)
+	_ BlockLoader = (*cachedStore)(nil)
+)

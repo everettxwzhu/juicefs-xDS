@@ -18,7 +18,6 @@ package xds
 
 import (
 	"fmt"
-	"hash/crc32"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,8 +31,6 @@ const (
 	maxEvictProbeSteps = 32
 )
 
-var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
-
 // PinnedSlot represents a cached block pinned in NVMe memory against eviction
 // until Unpin is called.
 type PinnedSlot struct {
@@ -41,13 +38,11 @@ type PinnedSlot struct {
 	Blob       BlobHandle
 	BlobOffset uint64
 	OrigLen    uint32
-	Checksum   uint32
 }
 
 type cacheEntry struct {
 	slotIdx  uint32
 	origLen  uint32
-	checksum uint32
 	expireAt int64 // unix nano; 0 disables expiry
 }
 
@@ -59,19 +54,16 @@ type cacheShard struct {
 // BlockCache implements a sharded, pin-safe NVMe slab block cache where each
 // fixed-size slot aligns 1:1 with one SPDK cluster for lock-free FastMap reads.
 type BlockCache struct {
-	rt             Runtime
-	metrics        *Metrics
-	blobs          []BlobHandle
-	blockSize      int
-	ioUnitSize     uint64
-	slotsPerBlob   uint32
-	totalSlots     uint32
-	verifyChecksum bool
-	cacheExpire    time.Duration
-	slotPins       []atomic.Uint32
+	rt           Runtime
+	metrics      *Metrics
+	blobs        []BlobHandle
+	blockSize    int
+	slotsPerBlob uint32
+	totalSlots   uint32
+	cacheExpire  time.Duration
+	slotPins     []atomic.Uint32
 
-	shards   [cacheShardCount]cacheShard
-	readPool sync.Pool // reusable full-block buffers for CRC/unaligned CPU reads
+	shards [cacheShardCount]cacheShard
 
 	allocMu      sync.Mutex
 	freeSlots    []uint32
@@ -87,26 +79,19 @@ func newBlockCache(
 	rt Runtime,
 	blobs []BlobHandle,
 	cfg Config,
-	ioUnitSize uint64,
 	metrics *Metrics,
 ) (*BlockCache, error) {
 	totalSlots := cfg.TotalSlots()
 	c := &BlockCache{
-		rt:             rt,
-		metrics:        metrics,
-		blobs:          blobs,
-		blockSize:      cfg.BlockSize,
-		ioUnitSize:     ioUnitSize,
-		slotsPerBlob:   uint32(cfg.BlobSize / uint64(cfg.BlockSize)),
-		totalSlots:     totalSlots,
-		verifyChecksum: cfg.VerifyChecksum,
-		cacheExpire:    cfg.CacheExpire,
-		slotPins:       make([]atomic.Uint32, totalSlots),
-		freeSlots:      make([]uint32, totalSlots),
-	}
-	c.readPool.New = func() any {
-		buf := make([]byte, cfg.BlockSize)
-		return &buf
+		rt:           rt,
+		metrics:      metrics,
+		blobs:        blobs,
+		blockSize:    cfg.BlockSize,
+		slotsPerBlob: uint32(cfg.BlobSize / uint64(cfg.BlockSize)),
+		totalSlots:   totalSlots,
+		cacheExpire:  cfg.CacheExpire,
+		slotPins:     make([]atomic.Uint32, totalSlots),
+		freeSlots:    make([]uint32, totalSlots),
 	}
 	for i := range totalSlots {
 		c.freeSlots[i] = totalSlots - 1 - i // pop from tail -> ascending order
@@ -180,7 +165,6 @@ func (c *BlockCache) Pin(key string) (PinnedSlot, bool) {
 	c.slotPins[ent.slotIdx].Add(1)
 	slotIdx := ent.slotIdx
 	origLen := ent.origLen
-	csum := ent.checksum
 	sh.mu.Unlock()
 
 	blob, off := c.slotLocation(slotIdx)
@@ -190,7 +174,6 @@ func (c *BlockCache) Pin(key string) (PinnedSlot, bool) {
 		Blob:       blob,
 		BlobOffset: off,
 		OrigLen:    origLen,
-		Checksum:   csum,
 	}, true
 }
 
@@ -238,10 +221,6 @@ func (c *BlockCache) Put(key string, data []byte) error {
 		return err
 	}
 
-	var csum uint32
-	if c.verifyChecksum {
-		csum = crc32.Checksum(data, crc32cTable)
-	}
 	var expireAt int64
 	if c.cacheExpire > 0 {
 		expireAt = time.Now().UnixNano() + c.cacheExpire.Nanoseconds()
@@ -263,7 +242,6 @@ func (c *BlockCache) Put(key string, data []byte) error {
 	sh.lru.Add(key, &cacheEntry{
 		slotIdx:  slotIdx,
 		origLen:  uint32(len(data)),
-		checksum: csum,
 		expireAt: expireAt,
 	})
 	sh.mu.Unlock()
@@ -277,62 +255,6 @@ func (c *BlockCache) Put(key string, data []byte) error {
 	c.metrics.CacheSlotsUsed.Inc()
 	c.metrics.CacheBytesUsed.Add(float64(len(data)))
 	return nil
-}
-
-// ReadAt reads len(dst) bytes from cached key starting at offset off into CPU
-// memory. This serves standard FUSE/POSIX reads through chunk.CacheManager.
-func (c *BlockCache) ReadAt(key string, dst []byte, off int64) (int, error) {
-	if off < 0 {
-		return 0, ErrInvalidArg
-	}
-	slot, ok := c.Pin(key)
-	if !ok {
-		return 0, ErrNotCached
-	}
-	defer c.Unpin(slot.SlotIndex)
-
-	if uint64(off) >= uint64(slot.OrigLen) {
-		return 0, nil
-	}
-	toRead := min(len(dst), int(uint64(slot.OrigLen)-uint64(off)))
-	if toRead == 0 {
-		return 0, nil
-	}
-
-	// Fast path 1: IOUnit-aligned offset without whole-block CRC verification.
-	if !c.verifyChecksum && uint64(off)%c.ioUnitSize == 0 {
-		if err := c.rt.ReadCPU(slot.Blob, slot.BlobOffset+uint64(off), dst[:toRead]); err != nil {
-			return 0, err
-		}
-		return toRead, nil
-	}
-
-	bufPtr := c.readPool.Get().(*[]byte)
-	defer c.readPool.Put(bufPtr)
-
-	// Fast path 2: unaligned offset without CRC verification reads only the
-	// minimal IOUnit-aligned window covering [off, off+toRead).
-	if !c.verifyChecksum {
-		alignedStart := uint64(off) &^ (c.ioUnitSize - 1)
-		headSkip := uint64(off) - alignedStart
-		alignedEnd := min(alignUp64(uint64(off)+uint64(toRead), c.ioUnitSize), uint64(c.blockSize))
-		win := (*bufPtr)[:alignedEnd-alignedStart]
-		if err := c.rt.ReadCPU(slot.Blob, slot.BlobOffset+alignedStart, win); err != nil {
-			return 0, err
-		}
-		return copy(dst[:toRead], win[headSkip:headSkip+uint64(toRead)]), nil
-	}
-
-	// Full-block read for CRC32C verification.
-	full := (*bufPtr)[:slot.OrigLen]
-	if err := c.rt.ReadCPU(slot.Blob, slot.BlobOffset, full); err != nil {
-		return 0, err
-	}
-	if crc32.Checksum(full, crc32cTable) != slot.Checksum {
-		c.Remove(key)
-		return 0, ErrCorrupt
-	}
-	return copy(dst[:toRead], full[off:off+int64(toRead)]), nil
 }
 
 // Remove unlinks key from the cache index and recycles its slot once all

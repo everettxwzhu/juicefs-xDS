@@ -69,7 +69,7 @@ struct jfs_xds_cq_slot {
 struct jfs_xds_io_slot {
 	struct iovec  inline_iovs[JFS_XDS_INLINE_IOVS];
 	struct iovec *dyn_iovs; // heap fallback only when total_iovs > 64
-	void         *dma_buf;  // SPDK hugepage buffer for ReadCPU/WriteCPU
+	void         *dma_buf;  // SPDK hugepage buffer for WriteCPU
 };
 
 // Process-internal wait-free MPSC completion queue shared between SPDK polling
@@ -232,47 +232,6 @@ static int jfs_xds_import_buf(int p2p_fd, uint64_t device_va, uint64_t size,
 	*reg_out = reg;
 	*io_ptr_out = (uintptr_t)io_ptr;
 	return 0;
-}
-
-static int jfs_xds_submit_read_cpu(uint32_t slot_id, uintptr_t blob_handle,
-	uint64_t blob_off, uint64_t len)
-{
-	uint64_t unit = xds_runtime_get_io_unit_size();
-	if (slot_id >= JFS_XDS_CQ_CAP || !blob_handle || len == 0 ||
-	    unit == 0 || (blob_off % unit) != 0) {
-		return -EINVAL;
-	}
-
-	uint64_t aligned_len = jfs_xds_align_up(len, unit);
-	void *dma_buf = xds_alloc_io_buffer(aligned_len);
-	if (!dma_buf)
-		return -ENOMEM;
-
-	g_cq.slots[slot_id].dma_buf = dma_buf;
-	struct xds_io_desc desc = {
-		.handle = (void *)blob_handle,
-		.payload = dma_buf,
-		.offset_bytes = blob_off,
-		.size_bytes = aligned_len,
-	};
-	int rc = xds_submit_read(&desc, jfs_xds_cq_cb, (void *)(uintptr_t)slot_id);
-	if (rc != 0) {
-		g_cq.slots[slot_id].dma_buf = NULL;
-		xds_free_io_buffer(dma_buf);
-	}
-	return rc;
-}
-
-static void jfs_xds_finish_read_cpu(uint32_t slot_id, void *dst,
-	uint64_t len, int copy_ok)
-{
-	void *dma_buf = g_cq.slots[slot_id].dma_buf;
-	g_cq.slots[slot_id].dma_buf = NULL;
-	if (!dma_buf)
-		return;
-	if (copy_ok && dst && len > 0)
-		memcpy(dst, dma_buf, (size_t)len);
-	xds_free_io_buffer(dma_buf);
 }
 
 static int jfs_xds_submit_write_cpu(uint32_t slot_id, uintptr_t blob_handle,
@@ -705,32 +664,6 @@ func (r *cgoRuntime) ImportBuffer(p2pFD int, deviceVA, size uint64, peers []Peer
 
 func (r *cgoRuntime) UnregisterBuffer(reg RegHandle) error {
 	return cErr("unregister_buf", C.xds_direct_unregister_buffer(C.uint64_t(reg)))
-}
-
-func (r *cgoRuntime) ReadCPU(blob BlobHandle, blobOff uint64, dst []byte) error {
-	if len(dst) == 0 {
-		return nil
-	}
-	slotID, err := r.acquireSlot()
-	if err != nil {
-		return err
-	}
-	defer r.releaseSlot(slotID)
-
-	rc := C.jfs_xds_submit_read_cpu(C.uint32_t(slotID), C.uintptr_t(blob),
-		C.uint64_t(blobOff), C.uint64_t(len(dst)))
-	if rc != 0 {
-		return cErr("read_cpu", rc)
-	}
-
-	err = <-r.slotCh[slotID]
-	copyOK := C.int(0)
-	if err == nil {
-		copyOK = 1
-	}
-	C.jfs_xds_finish_read_cpu(C.uint32_t(slotID), unsafe.Pointer(&dst[0]),
-		C.uint64_t(len(dst)), copyOK)
-	return err
 }
 
 func (r *cgoRuntime) WriteCPU(blob BlobHandle, blobOff uint64, src []byte) error {

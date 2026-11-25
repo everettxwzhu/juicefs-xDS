@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/juicedata/juicefs/pkg/xds"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -148,9 +150,10 @@ type Config struct {
 
 	Pid       int
 	PPid      int
-	CommPath  string       `json:",omitempty"`
-	StatePath string       `json:",omitempty"`
-	FuseOpts  *FuseOptions `json:",omitempty"`
+	CommPath  string            `json:",omitempty"`
+	StatePath string            `json:",omitempty"`
+	FuseOpts  *FuseOptions      `json:",omitempty"`
+	XDS       *xds.EndpointInfo `json:"xds,omitempty"`
 
 	// the mount point for current volume (to follow symlink)
 	Mountpoint string
@@ -179,8 +182,8 @@ func (v *VFS) Lookup(ctx Context, parent Ino, name string) (entry *meta.Entry, e
 	var attr = &Attr{}
 	if parent == rootID || name == internalNodes[0].name { // 0 is the control file
 		n := getInternalNodeByName(name)
-		if n != nil {
-			entry = &meta.Entry{Inode: n.inode, Attr: n.attr}
+		if n != nil && (n.inode != XDSInode || v.xdsState.Load() != nil) {
+			entry, err = v.internalNodeEntry(n)
 			return
 		}
 	}
@@ -206,8 +209,7 @@ func (v *VFS) Lookup(ctx Context, parent Ino, name string) (entry *meta.Entry, e
 
 func (v *VFS) GetAttr(ctx Context, ino Ino, opened uint8) (entry *meta.Entry, err syscall.Errno) {
 	if IsSpecialNode(ino) && getInternalNode(ino) != nil {
-		n := getInternalNode(ino)
-		entry = &meta.Entry{Inode: n.inode, Attr: n.attr}
+		entry, err = v.internalNodeEntry(getInternalNode(ino))
 		return
 	}
 	defer func() { logit(ctx, "getattr", err, "(%d):%s", ino, (*Entry)(entry)) }()
@@ -243,7 +245,7 @@ func (v *VFS) Mknod(ctx Context, parent Ino, name string, mode uint16, cumask ui
 	defer func() {
 		logit(ctx, "mknod", err, "(%d,%s,%s:0%04o,0x%08X):%s", parent, name, smode(mode), mode, rdev, (*Entry)(entry))
 	}()
-	if parent == rootID && IsSpecialName(name) {
+	if parent == rootID && v.isSpecialName(name) {
 		err = syscall.EEXIST
 		return
 	}
@@ -273,7 +275,7 @@ func (v *VFS) Unlink(ctx Context, parent Ino, name string) (err syscall.Errno) {
 
 func (v *VFS) doUnlink(ctx Context, parent Ino, name string, skipTrash bool) (err syscall.Errno) {
 	defer func() { logit(ctx, "unlink", err, "(%d,%s)", parent, name) }()
-	if parent == rootID && IsSpecialName(name) {
+	if parent == rootID && v.isSpecialName(name) {
 		err = syscall.EPERM
 		return
 	}
@@ -292,7 +294,7 @@ func (v *VFS) Mkdir(ctx Context, parent Ino, name string, mode uint16, cumask ui
 	defer func() {
 		logit(ctx, "mkdir", err, "(%d,%s,%s:0%04o):%s", parent, name, smode(mode), mode, (*Entry)(entry))
 	}()
-	if parent == rootID && IsSpecialName(name) {
+	if parent == rootID && v.isSpecialName(name) {
 		err = syscall.EEXIST
 		return
 	}
@@ -328,7 +330,7 @@ func (v *VFS) Symlink(ctx Context, path string, parent Ino, name string) (entry 
 	defer func() {
 		logit(ctx, "symlink", err, "(%d,%s,%s):%s", parent, name, path, (*Entry)(entry))
 	}()
-	if parent == rootID && IsSpecialName(name) {
+	if parent == rootID && v.isSpecialName(name) {
 		err = syscall.EEXIST
 		return
 	}
@@ -357,11 +359,11 @@ func (v *VFS) Rename(ctx Context, parent Ino, name string, newparent Ino, newnam
 	defer func() {
 		logit(ctx, "rename", err, "(%d,%s,%d,%s,%d)", parent, name, newparent, newname, flags)
 	}()
-	if parent == rootID && IsSpecialName(name) {
+	if parent == rootID && v.isSpecialName(name) {
 		err = syscall.EPERM
 		return
 	}
-	if newparent == rootID && IsSpecialName(newname) {
+	if newparent == rootID && v.isSpecialName(newname) {
 		err = syscall.EPERM
 		return
 	}
@@ -389,7 +391,7 @@ func (v *VFS) Link(ctx Context, ino Ino, newparent Ino, newname string) (entry *
 		err = syscall.EPERM
 		return
 	}
-	if newparent == rootID && IsSpecialName(newname) {
+	if newparent == rootID && v.isSpecialName(newname) {
 		err = syscall.EPERM
 		return
 	}
@@ -455,6 +457,9 @@ func (v *VFS) Readdir(ctx Context, ino Ino, size uint32, off int, fh uint64, plu
 		var initEntries []*meta.Entry
 		if ino == rootID && !v.Conf.HideInternal {
 			for _, node := range internalNodes[1:] {
+				if node.inode == XDSInode && v.xdsState.Load() == nil {
+					continue
+				}
 				initEntries = append(initEntries, &meta.Entry{
 					Inode: node.inode,
 					Name:  []byte(node.name),
@@ -513,7 +518,7 @@ func (v *VFS) Create(ctx Context, parent Ino, name string, mode uint16, cumask u
 	if doUnlink {
 		name = fmt.Sprintf("tmpfile_%s", uuid.New().String())
 	}
-	if parent == rootID && IsSpecialName(name) {
+	if parent == rootID && v.isSpecialName(name) {
 		err = syscall.EEXIST
 		return
 	}
@@ -557,6 +562,10 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 	}()
 	var attr = &Attr{}
 	if IsSpecialNode(ino) {
+		if ino == XDSInode && v.xdsState.Load() == nil {
+			err = syscall.ENOENT
+			return
+		}
 		if ino != controlInode && (flags&O_ACCMODE) != syscall.O_RDONLY {
 			err = syscall.EACCES
 			return
@@ -567,7 +576,8 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 		if n == nil {
 			return
 		}
-		entry = &meta.Entry{Inode: ino, Attr: n.attr}
+		attrCopy := *n.attr
+		entry = &meta.Entry{Inode: ino, Attr: &attrCopy}
 		switch ino {
 		case logInode:
 			openAccessLog(fh)
@@ -575,6 +585,9 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 			h.data = CollectMetrics(v.registry)
 		case ConfigInode:
 			h.data = v.marshalConf()
+			entry.Attr.Length = uint64(len(h.data))
+		case XDSInode:
+			h.data = v.marshalXDS()
 			entry.Attr.Length = uint64(len(h.data))
 		}
 		return
@@ -589,9 +602,72 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 	return
 }
 
+type xdsEndpointState struct {
+	info *xds.EndpointInfo
+	raw  []byte
+}
+
+func (v *VFS) isSpecialName(name string) bool {
+	if len(name) == 0 || name[0] != '.' {
+		return false
+	}
+	n := getInternalNodeByName(name)
+	if n == nil {
+		return false
+	}
+	if n.inode == XDSInode && v.xdsState.Load() == nil {
+		return false
+	}
+	return true
+}
+
+func (v *VFS) internalNodeEntry(n *internalNode) (*meta.Entry, syscall.Errno) {
+	switch n.inode {
+	case XDSInode:
+		st := v.xdsState.Load()
+		if st == nil {
+			return nil, syscall.ENOENT
+		}
+		attr := *n.attr
+		attr.Length = uint64(len(st.raw))
+		return &meta.Entry{Inode: n.inode, Attr: &attr}, 0
+	case ConfigInode:
+		attr := *n.attr
+		attr.Length = uint64(len(v.marshalConf()))
+		return &meta.Entry{Inode: n.inode, Attr: &attr}, 0
+	}
+	return &meta.Entry{Inode: n.inode, Attr: n.attr}, 0
+}
+
+// SetXDSEndpoint publishes (or clears when nil) the active xDS direct-read
+// endpoint metadata to both .config and the world-readable .xds virtual file.
+func (v *VFS) SetXDSEndpoint(info *xds.EndpointInfo) {
+	if info == nil {
+		v.xdsState.Store(nil)
+		return
+	}
+	cp := *info
+	cp.PeerBDFs = append([]string(nil), info.PeerBDFs...)
+	raw, _ := json.MarshalIndent(&cp, "", " ")
+	v.xdsState.Store(&xdsEndpointState{info: &cp, raw: raw})
+}
+
+func (v *VFS) marshalXDS() []byte {
+	st := v.xdsState.Load()
+	if st == nil {
+		return nil
+	}
+	return st.raw
+}
+
 // marshalConf renders the config with the latest format on a private copy.
 func (v *VFS) marshalConf() []byte {
 	conf := *v.Conf
+	if st := v.xdsState.Load(); st != nil {
+		conf.XDS = st.info
+	} else {
+		conf.XDS = nil
+	}
 	conf.Format = v.Meta.GetFormat()
 	if v.UpdateFormat != nil {
 		v.UpdateFormat(&conf.Format)
@@ -718,6 +794,8 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 				h.data = CollectMetrics(v.registry)
 			case ConfigInode:
 				h.data = v.marshalConf()
+			case XDSInode:
+				h.data = v.marshalXDS()
 			}
 		}
 
@@ -1246,6 +1324,7 @@ type VFS struct {
 	modifiedAt map[Ino]time.Time
 
 	registry *prometheus.Registry
+	xdsState atomic.Pointer[xdsEndpointState]
 }
 
 func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer prometheus.Registerer, registry *prometheus.Registry) *VFS {
@@ -1270,6 +1349,9 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 	v.Conf.Format.RemoveSecret()
 	data, _ := json.MarshalIndent(v.Conf, "", " ")
 	n.attr.Length = uint64(len(data))
+	if conf.XDS != nil {
+		v.SetXDSEndpoint(conf.XDS)
+	}
 	if conf.Meta.Subdir != "" { // don't show trash directory
 		internalNodes = internalNodes[:len(internalNodes)-1]
 	}

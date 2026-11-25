@@ -722,6 +722,10 @@ func canShutdownGracefully(mp string, newConf *vfs.Config) bool {
 		logger.Infof("different volume %s != %s, mount on top of it", oldConf.Format.Name, newConf.Format.Name)
 		return false
 	}
+	if oldConf.XDS != nil || newConf.XDS != nil {
+		logger.Infof("xDS embedded SPDK runtime does not support graceful upgrade, mount on top of it")
+		return false
+	}
 	oldVersion := version.Parse(oldConf.Version)
 	if ret, _ := version.CompareVersions(oldVersion, version.Parse("1.2.0")); ret <= 0 {
 		oldConf.FuseOpts.MaxWrite = 128 * 1024
@@ -941,6 +945,10 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 			sig := <-signalChan
 			logger.Infof("Received signal %s, exiting...", sig.String())
 			if sig == syscall.SIGHUP {
+				if v.Conf.XDS != nil {
+					logger.Warnf("xDS embedded SPDK runtime does not support SIGHUP graceful restart, ignoring")
+					continue
+				}
 				path := fmt.Sprintf("/tmp/state%d.json", os.Getppid())
 				if err := v.FlushAll(""); err == nil {
 					if !fuse.Shutdown() {

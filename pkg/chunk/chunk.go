@@ -53,3 +53,11 @@ type ChunkStore interface {
 	UpdateLimit(upload, download int64)
 	BlobStorage() object.ObjectStorage
 }
+
+// BlockLoader reads a full plaintext block into an off-heap Page without
+// writing into the store's POSIX disk/memory cache. Sidecar caches (such as
+// pkg/xds) use this interface to populate their own storage tier while keeping
+// normal POSIX I/O and cache replacement completely untouched.
+type BlockLoader interface {
+	LoadBlock(ctx context.Context, key string, size int) (*Page, error)
+}

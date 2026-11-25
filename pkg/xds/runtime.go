@@ -91,10 +91,6 @@ type Runtime interface {
 	// UnregisterBuffer unmaps a previously imported buffer after all I/O drains.
 	UnregisterBuffer(reg RegHandle) error
 
-	// ReadCPU reads len(dst) bytes starting at blobOff (which must be IOUnit
-	// aligned) from blob into CPU memory dst.
-	ReadCPU(blob BlobHandle, blobOff uint64, dst []byte) error
-
 	// WriteCPU writes src to blob at blobOff (IOUnit aligned), zero-padding the
 	// trailing partial IOUnit automatically.
 	WriteCPU(blob BlobHandle, blobOff uint64, src []byte) error

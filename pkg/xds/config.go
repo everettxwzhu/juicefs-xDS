@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-// Package xds implements a device-agnostic local NVMe cache engine and
+// Package xds implements a device-agnostic sidecar NVMe cache engine and
 // cross-process direct-read server backed by the embedded xDS SPDK runtime.
 //
 // The package intentionally has no dependency on pkg/chunk, pkg/vfs, pkg/meta,
 // or any GPU/NPU vendor SDK. Upper layers bridge file resolution through the
-// FileResolver interface and wrap Engine.Cache() into chunk.CacheManager.
+// FileResolver interface while leaving JuiceFS's native POSIX cache untouched.
 package xds
 
 import (
@@ -46,7 +46,6 @@ var (
 	ErrInvalidArg  = errors.New("xds: invalid argument")
 	ErrPerm        = errors.New("xds: permission denied")
 	ErrNoSpace     = errors.New("xds: no free cache slot available")
-	ErrCorrupt     = errors.New("xds: cached block checksum mismatch")
 )
 
 // DeviceBackend identifies the opaque xDS P2P kernel backend passed through to
@@ -130,12 +129,11 @@ type Config struct {
 	// Cache geometry. BlockSize should match JuiceFS chunk.Config.BlockSize
 	// (default 4 MiB); ClusterSize defaults to BlockSize so every block stays
 	// inside a single SPDK cluster for 100% FastMap direct-LBA hits.
-	BlockSize      int           `json:"block_size"`
-	BlobSize       uint64        `json:"xds_blob_size_bytes"`
-	BlobCount      uint32        `json:"xds_blob_count"`
-	EnableFastMap  bool          `json:"xds_enable_blob_fast_map"`
-	VerifyChecksum bool          `json:"verify_checksum"`
-	CacheExpire    time.Duration `json:"cache_expire"`
+	BlockSize     int           `json:"block_size"`
+	BlobSize      uint64        `json:"xds_blob_size_bytes"`
+	BlobCount     uint32        `json:"xds_blob_count"`
+	EnableFastMap bool          `json:"xds_enable_blob_fast_map"`
+	CacheExpire   time.Duration `json:"cache_expire"`
 
 	// Cross-process Unix SOCK_SEQPACKET server settings.
 	SocketPath  string      `json:"socket_path"`
@@ -225,8 +223,4 @@ func (c *Config) Normalize() error {
 func (c *Config) TotalSlots() uint32 {
 	slotsPerBlob := uint32(c.BlobSize / uint64(c.BlockSize))
 	return c.BlobCount * slotsPerBlob
-}
-
-func alignUp64(v, align uint64) uint64 {
-	return (v + align - 1) &^ (align - 1)
 }

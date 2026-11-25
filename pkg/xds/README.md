@@ -9,7 +9,7 @@
 1. **零修改 `xDS/` 子模块**：仅链接 `xDS/include/xds/{runtime,blob_pool,io,dma_registry,completion}.h` 公开 C API。
 2. **嵌入式 Runtime 架构**：独立 `xds_service` 强制按 queue 独占 blob 与已注册 buffer（跨 queue 访问返回 `-EPERM`），因此由 JuiceFS 挂载进程直接嵌入 `xds_runtime`，统一托管 NVMe Slab 缓存池与跨进程导入的设备显存 DMA 映射。
 3. **100% 设备无关**：`pkg/xds` 不依赖任何 CUDA / HIP / CANN / COREX SDK，也不包含厂商分支；`DeviceBackend` 与 `PeerExport` 仅作为不透明元数据透传给 xDS 内核驱动。
-4. **零循环依赖**：不引入 `pkg/chunk`、`pkg/vfs`、`pkg/meta` 或 `pkg/fuse`；上层通过 `FileResolver` 接口桥接文件块解析，并将 `Engine.Cache()` 包装为 `chunk.CacheManager`。
+4. **零循环依赖 & 旁路解耦**：不引入 `pkg/chunk`、`pkg/vfs`、`pkg/meta` 或 `pkg/fuse`；仅作为显存直通旁路（Sidecar）引擎挂载在 `vfs.XDSResolver` 下，**不接管**普通 POSIX/FUSE 读写的 `chunk.CacheManager`。
 5. **条件编译隔离**：默认构建（无 `-tags xds` 或非 Linux 平台）自动回退到 `runtime_stub.go`，不给标准 JuiceFS 二进制增加任何 CGo / SPDK 依赖。
 
 ---
@@ -35,7 +35,7 @@ pkg/xds/
 #### 2.1 NVMe Slab 缓存与 FastMap 100% 命中（`cache.go`）
 - **1:1 槽位对齐**：`Config.BlockSize`（默认 4 MiB）直接作为 SPDK `cluster_size_bytes`，`BlobSize` 为 `BlockSize` 的整数倍（默认 64 MiB = 16 slots/blob）。每个缓存块完整落在单个 SPDK cluster 内，保证 `enable_fast_map = true` 下读取直达物理 LBA，无需查 Blobstore 元数据。
 - **Pin-Safe 淘汰与延迟回收**：`BlockCache` 内部维护 64 分片 `simplelru` 与纯 Go `slotPins []atomic.Uint32`。在途 DMA 通过 `Pin(key)` 在分片锁内原子递增引用计数；淘汰（`evictOne` 轮询分片单次加锁）会跳过已 pin 槽位；`Remove` 卸载被 pin 块时将槽位放入 `retiredSlots`，待 pin 归零后由 `allocSlot` 自动回收，绝不覆盖在途 DMA 内存。
-- **CPU 读防放大**：未开启 `VerifyChecksum` 时，对齐读直走 `ReadCPU`；非对齐读仅读取覆盖 `[off, off+toRead)` 的最小 `IOUnitSize` 对齐窗口，避免整块 4 MiB 读放大。
+- **纯旁路直通定位**：数据面仅保留 `BlockCache.Put`（对象存储缺块写入 NVMe）与 `Pin` + `ReadDirectBatch`（NVMe → 显存 P2P DMA），彻底移除无用的 CPU 读路径与无效 CRC 计算开销。
 
 #### 2.2 统一 `SOCK_SEQPACKET` 流水线 + Go 原生并发模型（`server.go` / `runtime_cgo.go`）
 - **控制面与数据面合一**：所有消息复用同一条 Unix `SOCK_SEQPACKET` 连接（天然保序、保留消息边界、支持 `SCM_RIGHTS` 传 fd 与 `SO_PEERCRED` 鉴权）。客户端可通过 `req_id` 并发流水线发送最多 `MaxInflight`（默认 64）条 `MSG_READ_DIRECT` 请求。
@@ -70,7 +70,7 @@ flowchart LR
     Server -->|Import / ReadDirectBatch| Engine
     Engine --> Cache
     Engine --> CGo
-    Cache -->|WriteCPU / ReadCPU| CGo
+    Cache -->|WriteCPU 填充| CGo
     CGo --> XDS
     XDS -->|SPDK P2P DMA| NVMe
     NVMe -.->|PCIe P2P 直写| VRAM
@@ -116,13 +116,9 @@ sequenceDiagram
     S-->>C: MSG_STATUS (0)
 ```
 
-### 3.3 普通 POSIX / FUSE 读链路（`BlockCache` 作为 `chunk.CacheManager`）
-1. 写缓存：`BlockCache.Put(key, data)` → 分配/淘汰未 pin 槽位 → `Runtime.WriteCPU`（按 `IOUnitSize` 向上对齐并零填充尾块，不持有分片锁）→ 写入分片 LRU（可选计算 CRC32C 与过期时间）。
-2. 读缓存：`BlockCache.ReadAt(key, dst, off)` → `Pin(key)` →
-   - 未启用 CRC 且 `off % IOUnitSize == 0`：直调 `ReadCPU` 读入 `dst`；
-   - 未启用 CRC 且 `off` 非对齐：池化缓冲读取最小 `IOUnitSize` 对齐窗口后拷贝切片；
-   - 启用 CRC：整块读取并校验 CRC32C，不匹配则自动 `Remove(key)` 并返回 `ErrCorrupt`；
-   - `defer Unpin(slot.SlotIndex)`。
+### 3.3 旁路缺块回填路径（`BlockCache.Put`）
+1. 显存直读未命中 `BlockCache` 时，由 `vfs.XDSResolver` 通过 `chunk.BlockLoader.LoadBlock`（先只读检查本地 POSIX 缓存/writeback staging，未命中则经 `store.group` 单飞拉取并带重试）获取明文堆外 `*Page`，**不回写 POSIX 磁盘缓存**；
+2. `BlockCache.Put(key, data)` → 分配/淘汰未 pin 槽位 → `Runtime.WriteCPU`（按 `IOUnitSize` 向上对齐并零填充尾块，不持有分片锁）→ 写入分片 LRU（支持可选 `CacheExpire` 过期）。
 
 ### 3.4 异常断连与优雅关闭链路
 - **客户端崩溃**：`conn.ReadMsgUnix` 返回 EOF → `teardown()` 调用 `sess.cancel()` 取消在途 `ResolveRead` → `sess.ioWG.Wait()` 等待所有在途 SPDK DMA 完成并释放 `BlockCache` pin → 逐个调用 `Engine.UnregisterBuffer` 释放内核 P2P 映射。
@@ -132,14 +128,22 @@ sequenceDiagram
 
 ## 4. 使用方法
 
-### 4.1 编译与依赖
+### 4.1 编译与挂载
 
-- **标准编译（无需 xDS / SPDK）**：`pkg/xds` 自动使用 `runtime_stub.go`，可直接 `go build ./...`。
-- **开启 xDS 支持（Linux）**：构建好 xDS 运行时动态库 `dist/xds/libjfs_xds_runtime.so` 后，传入 `-tags xds`：
+- **标准编译（无需 xDS / SPDK）**：`make juicefs` 自动使用 `runtime_stub.go`，不给标准二进制增加任何 CGo / SPDK 依赖。
+- **开启 xDS 支持（Linux）**：构建好 xDS 运行时动态库 `dist/xds/libjfs_xds_runtime.so` 后执行：
   ```sh
-  go build -tags xds ./...
+  make juicefs.xds
+  ./juicefs.xds mount --xds-config /etc/juicefs/xds.json sqlite3://meta.db /mnt/jfs
   ```
-  CGo 编译期引用头文件目录 `xDS/include` 与 `xDS/kernels/include`，链接路径为 `dist/xds`（见 `runtime_cgo.go`）。
+  CGo 编译期引用 `xDS/include` 与 `xDS/kernels/include`，链接路径为 `dist/xds`（见 `runtime_cgo.go`）。
+  挂载启动后，普通 POSIX/FUSE 读写与 `--cache-dir` / `--os-cache` / `--writeback` **完全保持原生路径不变**；`xds.Engine` 与 `xds.Server` 仅作为显存 P2P 直通旁路运行（未命中时通过 `chunk.BlockLoader` 单飞拉取并直接写入 `xds.BlockCache`，不污染 POSIX 磁盘缓存），并在挂载根目录暴露 `0444` 虚拟文件 `.xds`（同时在 `.config` 中追加 `xds` 字段）供外部进程发现。
+
+- **外部 C/C++ 客户端库（`sdk/xds`）**：
+  ```sh
+  make -C sdk/xds all   # 生成 libjfs_xds.so / libjfs_xds.a
+  ```
+  设备无关封装 `jfs_xds_discover_socket` → `jfs_xds_connect` → `jfs_xds_bind_file` → `jfs_xds_register_buffer` → `jfs_xds_read` / `jfs_xds_readv`。
 
 ### 4.2 配置文件示例
 

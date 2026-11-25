@@ -34,6 +34,5 @@ func (*stubRuntime) ImportBuffer(int, uint64, uint64, []PeerExport) (RegHandle, 
 	return 0, 0, ErrUnsupported
 }
 func (*stubRuntime) UnregisterBuffer(RegHandle) error          { return ErrUnsupported }
-func (*stubRuntime) ReadCPU(BlobHandle, uint64, []byte) error  { return ErrUnsupported }
 func (*stubRuntime) WriteCPU(BlobHandle, uint64, []byte) error { return ErrUnsupported }
 func (*stubRuntime) ReadDirectBatch([]DirectReadDesc) error    { return ErrUnsupported }

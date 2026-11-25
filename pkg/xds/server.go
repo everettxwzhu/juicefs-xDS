@@ -211,7 +211,14 @@ func NewServer(engine *Engine, resolver FileResolver) (*Server, error) {
 	if cfg.SocketPath == "" {
 		return nil, fmt.Errorf("%w: empty socket_path", ErrInvalidArg)
 	}
-	_ = os.Remove(cfg.SocketPath)
+	if _, err := os.Stat(cfg.SocketPath); err == nil {
+		conn, dialErr := net.DialTimeout("unixpacket", cfg.SocketPath, 100*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("%w: socket %q is already in use", ErrBusy, cfg.SocketPath)
+		}
+		_ = os.Remove(cfg.SocketPath)
+	}
 
 	addr := &net.UnixAddr{Name: cfg.SocketPath, Net: "unixpacket"}
 	ln, err := net.ListenUnix("unixpacket", addr)
@@ -426,7 +433,8 @@ func (sess *clientSession) handleBindFile(reqID uint64, fds []int) {
 	defer func() { _ = unix.Close(fd) }()
 
 	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
-	if err != nil || (flags&unix.O_ACCMODE) == unix.O_WRONLY {
+	accMode := flags & unix.O_ACCMODE
+	if err != nil || (flags&unix.O_PATH) != 0 || (accMode != unix.O_RDONLY && accMode != unix.O_RDWR) {
 		sess.sendStatus(reqID, -int32(syscall.EACCES))
 		return
 	}

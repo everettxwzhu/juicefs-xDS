@@ -80,9 +80,9 @@ typedef struct jfs_xds_hello_reply {
 } jfs_xds_hello_reply;
 
 /* Sent with 1 fd via SCM_RIGHTS: client's opened readable file descriptor. */
-typedef struct jfs_xds_bind_file {
+typedef struct jfs_xds_bind_file_req {
 	jfs_xds_msg_hdr hdr;
-} jfs_xds_bind_file;
+} jfs_xds_bind_file_req;
 
 typedef struct jfs_xds_bind_file_reply {
 	jfs_xds_msg_hdr hdr;

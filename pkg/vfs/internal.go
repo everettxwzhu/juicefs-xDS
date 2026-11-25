@@ -42,6 +42,7 @@ const (
 	controlInode    = minInternalNode + 2
 	StatsInode      = minInternalNode + 3
 	ConfigInode     = minInternalNode + 4
+	XDSInode        = minInternalNode + 5
 	trashInode      = meta.TrashInode
 )
 
@@ -81,6 +82,7 @@ var internalNodes = []*internalNode{
 	{logInode, ".accesslog", &Attr{Mode: 0400}},
 	{StatsInode, ".stats", &Attr{Mode: 0444}},
 	{ConfigInode, ".config", &Attr{Mode: 0400}},
+	{XDSInode, ".xds", &Attr{Mode: 0444}},
 	{trashInode, meta.TrashName, &Attr{Mode: 0555}},
 }
 
@@ -110,10 +112,15 @@ func IsSpecialNode(ino Ino) bool {
 }
 
 func IsSpecialName(name string) bool {
-	if name[0] != '.' {
+	if len(name) == 0 || name[0] != '.' {
 		return false
 	}
 	for _, n := range internalNodes {
+		// XDSInode is active only on mounts with an xDS endpoint; VFS enforces
+		// it per-instance via isSpecialName so non-xDS mounts never reserve ".xds".
+		if n.inode == XDSInode {
+			continue
+		}
 		if name == n.name {
 			return true
 		}
