@@ -18,12 +18,10 @@
 
 ```text
 pkg/xds/
-├── proto.h          # 跨进程 Unix SOCK_SEQPACKET 二进制协议定义（含 C11 _Static_assert）
-├── bridge.h         # CGo 桥接头文件（扁平无指针结构体，热路径零 C 堆分配）
-├── bridge.c         # 嵌入式 xDS runtime / blob_pool / DMA registry / 同步批量读封装（linux && xds）
+├── proto.h          # 外部 C/C++ 客户端跨进程 Unix SOCK_SEQPACKET 协议头文件（含 C11 _Static_assert）
 ├── config.go        # Config / DeviceBackend(JSON) / EndpointInfo / 错误定义与参数规范化
 ├── runtime.go       # Runtime 抽象接口与与 CGo 解耦的数据类型（支持纯内存 fakeRuntime 单测）
-├── runtime_cgo.go   # Linux + -tags xds 的 CGo Runtime 实现
+├── runtime_cgo.go   # Linux + -tags xds 的 CGo 实现：直接调用 xDS C API + 内联极薄异步转同步 shim
 ├── runtime_stub.go  # 默认/非 Linux 编译期占位 Stub（返回 ErrUnsupported）
 ├── metrics.go       # Prometheus 指标定义与注册
 ├── engine.go        # Engine：托管 Runtime 生命周期、Blob 租约、BlockCache 与 P2P DMA 入口
@@ -39,10 +37,10 @@ pkg/xds/
 - **Pin-Safe 淘汰与延迟回收**：`BlockCache` 内部维护 64 分片 `simplelru` 与纯 Go `slotPins []atomic.Uint32`。在途 DMA 通过 `Pin(key)` 在分片锁内原子递增引用计数；淘汰（`evictOne` 轮询分片单次加锁）会跳过已 pin 槽位；`Remove` 卸载被 pin 块时将槽位放入 `retiredSlots`，待 pin 归零后由 `allocSlot` 自动回收，绝不覆盖在途 DMA 内存。
 - **CPU 读防放大**：未开启 `VerifyChecksum` 时，对齐读直走 `ReadCPU`；非对齐读仅读取覆盖 `[off, off+toRead)` 的最小 `IOUnitSize` 对齐窗口，避免整块 4 MiB 读放大。
 
-#### 2.2 统一 `SOCK_SEQPACKET` 流水线 + Go 原生并发模型（`server.go` / `bridge.c`）
+#### 2.2 统一 `SOCK_SEQPACKET` 流水线 + Go 原生并发模型（`server.go` / `runtime_cgo.go`）
 - **控制面与数据面合一**：所有消息复用同一条 Unix `SOCK_SEQPACKET` 连接（天然保序、保留消息边界、支持 `SCM_RIGHTS` 传 fd 与 `SO_PEERCRED` 鉴权）。客户端可通过 `req_id` 并发流水线发送最多 `MaxInflight`（默认 64）条 `MSG_READ_DIRECT` 请求。
 - **标量/散射读合一**：`JFS_XDS_MSG_READ_DIRECT` 头部 56 字节后紧跟 `slice_count`（1~64）个 24 字节 `slice`，1-slice 标量读仅 80 字节；回包 `JFS_XDS_MSG_READ_DIRECT_REPLY` 头部 40 字节后紧跟 `hole_count`（0~32）个 24 字节稀疏空洞，0 空洞回包仅 40 字节且零堆分配。
-- **无跨语言锁与零堆分配 C 热路径**：`handleReadDirect` 校验并增加 `importedBuf.inflight`（`sync.WaitGroup`）后起 goroutine 并发调用 `Engine.ReadDirectBatch`。`bridge.c` 内部对 `<= 32` desc 且 `<= 64` iov 直接使用栈数组并复用 `sem_t` 等待 SPDK 批量回调（SPDK reactor 回调仅执行 `w->status = status; sem_post(&w->sem)`，绝无阻塞风险），Go 侧通过 `defer cache.Unpin(idx)` 与 `sync.WaitGroup` 完成槽位释放与排空。
+- **零独立 C 源文件、零堆分配 C 热路径**：`runtime_cgo.go` 直接 `#include "xds/*.h"` 调用 `xds_runtime_*`、`xds_blob_pool_*` 与 `xds_direct_unregister_buffer`，仅内联极薄的 `static` C 辅助函数将异步 SPDK 回调转为 `sem_t` 阻塞等待（`<= 32` desc 且 `<= 64` iov 直接使用栈数组，回调中仅执行 `w->status = status; sem_post(&w->sem)`）；Go 侧通过 `defer cache.Unpin(idx)` 与 `sync.WaitGroup` 完成槽位释放与排空。
 - **单 goroutine 所有权**：每个连接的 `files` / `bufs` 映射仅由 `handleConn` 单读循环访问（无需会话表锁）；`writeMu` 串行化回包写入；任何写错误立即 `sess.cancel()` 唤醒阻塞读/背压路径。
 
 ---
@@ -59,7 +57,7 @@ flowchart LR
     Resolver["FileResolver (JuiceFS VFS/Chunk)"]
     Engine["xds.Engine (engine.go)"]
     Cache["xds.BlockCache (cache.go)"]
-    CGo["cgoRuntime / bridge.c"]
+    CGo["cgoRuntime (runtime_cgo.go)"]
     XDS["嵌入式 xDS SPDK Runtime + BlobPool"]
     NVMe["本地 NVMe SSD"]
     VRAM["设备显存 (GPU/NPU P2P BAR)"]
@@ -87,7 +85,7 @@ sequenceDiagram
     participant W as Read Goroutine
     participant R as FileResolver (JuiceFS)
     participant B as BlockCache
-    participant E as Engine / bridge.c / SPDK
+    participant E as Engine / runtime_cgo / SPDK
 
     C->>S: MSG_HELLO
     S-->>C: MSG_HELLO_REPLY (io_unit_size, block_size, max_inflight, peer_bdfs, device_backend)
@@ -281,12 +279,12 @@ func startXDS(cfgPath string, reg prometheus.Registerer, mountDev uint64) (*xds.
 # 1. 运行全套单测与竞态检测
 go test -race -v -count=1 ./pkg/xds/...
 
-# 2. 静态检查（默认模式、xds CGo 模式、跨平台非 Linux 模式）
+# 2. 静态检查（默认模式、xds CGo 模式含 -Wall -Wextra、跨平台非 Linux 模式）
 go vet ./pkg/xds/...
-go vet -tags xds ./pkg/xds/...
+CGO_CFLAGS="-Wall -Wextra" go vet -tags xds ./pkg/xds/...
 GOOS=darwin go vet ./pkg/xds/...
 
-# 3. 校验 C 桥接代码与 proto.h 全部 _Static_assert 布局断言
-gcc -fsyntax-only -Wall -Wextra -std=gnu11 -D_GNU_SOURCE \
-    -IxDS/include -IxDS/kernels/include pkg/xds/bridge.c
+# 3. 校验 proto.h 在 C11 / C++11 下的全部 _Static_assert 布局断言
+gcc -fsyntax-only -Wall -Wextra -std=gnu11 -x c pkg/xds/proto.h
+g++ -fsyntax-only -Wall -Wextra -std=c++11 -x c++ pkg/xds/proto.h
 ```

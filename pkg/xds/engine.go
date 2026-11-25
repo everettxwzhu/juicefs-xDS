@@ -17,7 +17,6 @@
 package xds
 
 import (
-	"errors"
 	"fmt"
 	"sync/atomic"
 
@@ -140,5 +139,8 @@ func (e *Engine) Close() error {
 	e.cache.close()
 	err1 := e.rt.ReleaseBlobs(e.blobs)
 	err2 := e.rt.Stop()
-	return errors.Join(err1, err2)
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }
