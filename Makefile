@@ -48,7 +48,7 @@ juicefs.fdb: Makefile cmd/*.go pkg/*/*.go
 juicefs.fdb.cover: Makefile cmd/*.go pkg/*/*.go
 	go build -tags fdb -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -cover -o juicefs.fdb .
 
-juicefs.xds: Makefile cmd/*.go pkg/*/*.go
+juicefs.xds: Makefile cmd/*.go pkg/*/*.go pkg/xds/*.c pkg/xds/*.h
 	go build -tags xds -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.xds .
 
 juicefs.gluster: Makefile cmd/*.go pkg/*/*.go

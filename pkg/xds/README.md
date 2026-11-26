@@ -21,7 +21,9 @@ pkg/xds/
 ├── proto.h          # 外部 C/C++ 客户端跨进程 Unix SOCK_SEQPACKET 协议头文件（含 C11 _Static_assert）
 ├── config.go        # Config / DeviceBackend(JSON) / EndpointInfo / 错误定义与参数规范化
 ├── runtime.go       # Runtime 抽象接口与与 CGo 解耦的数据类型（支持纯内存 fakeRuntime 单测）
-├── runtime_cgo.go   # Linux + -tags xds 的 CGo 实现：直调 xDS C API + 进程内无锁全局 CQ & eventfd netpoller
+├── runtime_cgo.go   # Linux + -tags xds 的 CGo 绑定：调用 xDS C API 与 Go eventfd netpoller 分发
+├── runtime_cgo.h    # runtime_cgo 的 C 接口与数据结构声明
+├── runtime_cgo.c    # runtime_cgo 的 C 实现：进程内无锁 MPSC CQ、iovec/DMA 槽位托管与同步控制封装
 ├── runtime_stub.go  # 默认/非 Linux 编译期占位 Stub（返回 ErrUnsupported）
 ├── metrics.go       # Prometheus 指标定义与注册
 ├── engine.go        # Engine：托管 Runtime 生命周期、Blob 租约、BlockCache 与 P2P DMA 入口
